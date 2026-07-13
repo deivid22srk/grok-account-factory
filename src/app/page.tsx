@@ -516,6 +516,7 @@ function CreateJobPanel({
   const isDone = state.status === "saved"
   const isError = state.status === "error"
   const isWaiting = state.status === "awaiting_authorization" || state.status === "polling" || state.status === "creating_email"
+  const hasCode = !!state.latestCode
 
   return (
     <div className="space-y-6">
@@ -532,7 +533,7 @@ function CreateJobPanel({
               {isWaiting && state.status !== "creating_email" && (
                 <div className="mt-2 flex items-center gap-2 text-xs text-zinc-400">
                   <Loader2 className="size-3 animate-spin" />
-                  Polling do OAuth a cada 5s — aguardando autorização…
+                  Monitorando email + OAuth a cada 5s — aguardando você concluir…
                 </div>
               )}
             </div>
@@ -540,16 +541,17 @@ function CreateJobPanel({
         </CardContent>
       </Card>
 
-      {/* Verification URL */}
+      {/* === STEP 1: Open the link === */}
       {isWaiting && state.verificationUrl && (
         <Card className="bg-zinc-900/60 border-zinc-800 border-emerald-900/40">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
+              <span className="size-6 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-bold flex items-center justify-center">1</span>
               <ExternalLink className="size-4 text-emerald-400" />
-              Passo 1 — Abra este link e autorize
+              Abra este link no seu navegador
             </CardTitle>
             <CardDescription>
-              Use o email e senha abaixo para entrar (ou criar conta) no xAI. Depois clique em "Allow".
+              Esta é a página oficial do xAI para autorizar o <code className="text-emerald-300 bg-zinc-800 px-1 rounded">grok-proxy-cli</code>.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -573,75 +575,193 @@ function CreateJobPanel({
               </Button>
             </div>
             <div className="rounded-md bg-zinc-950/60 border border-zinc-800 p-3 text-xs">
-              <span className="text-zinc-500">user_code:</span>{" "}
+              <span className="text-zinc-500">user_code (caso peça):</span>{" "}
               <code className="text-emerald-300 font-bold tracking-wider">{state.userCode}</code>
             </div>
           </CardContent>
         </Card>
       )}
 
-      {/* Email + password */}
+      {/* === STEP 2: Sign up with email + your own password === */}
       {isWaiting && state.mail && (
-        <div className="grid gap-4 md:grid-cols-2">
-          <Card className="bg-zinc-900/60 border-zinc-800">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Mail className="size-4 text-cyan-400" />
-                Email temporário
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <Input
-                readOnly
-                value={state.mail.address}
-                className="font-mono text-sm bg-zinc-950 border-zinc-800"
-              />
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => onCopy(state.mail!.address, "Email")}
-                className="w-full border-zinc-700"
-              >
-                <Copy className="size-3 mr-2" /> Copiar email
-              </Button>
-            </CardContent>
-          </Card>
-
-          <Card className="bg-zinc-900/60 border-zinc-800">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Lock className="size-4 text-amber-400" />
-                Senha
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              <div className="flex gap-2">
+        <Card className="bg-zinc-900/60 border-zinc-800 border-cyan-900/40">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <span className="size-6 rounded-full bg-cyan-500/20 text-cyan-300 text-xs font-bold flex items-center justify-center">2</span>
+              <Mail className="size-4 text-cyan-400" />
+              Na página do xAI, clique em <span className="text-cyan-300">"Sign up"</span> e use:
+            </CardTitle>
+            <CardDescription>
+              ⚠️ <b>Não use "Sign in"</b> — a conta ainda não existe. Clique em <b>Sign up</b> / <b>Create account</b>.
+              Escolha <b>SUA PRÓPRIA senha</b> para o xAI (você decide qual).
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-3 md:grid-cols-2">
+              {/* Email */}
+              <div className="space-y-2">
+                <Label className="text-xs text-zinc-400">Email temporário (use no xAI)</Label>
                 <Input
                   readOnly
-                  type={showPassword ? "text" : "password"}
-                  value={state.mail.password}
+                  value={state.mail.address}
                   className="font-mono text-sm bg-zinc-950 border-zinc-800"
                 />
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={onTogglePassword}
-                  className="border-zinc-700"
+                  onClick={() => onCopy(state.mail!.address, "Email")}
+                  className="w-full border-zinc-700"
                 >
-                  {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                  <Copy className="size-3 mr-2" /> Copiar email
                 </Button>
               </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => onCopy(state.mail!.password, "Senha")}
-                className="w-full border-zinc-700"
-              >
-                <Copy className="size-3 mr-2" /> Copiar senha
-              </Button>
-            </CardContent>
-          </Card>
-        </div>
+
+              {/* mail.tm password (just for reading the email) */}
+              <div className="space-y-2">
+                <Label className="text-xs text-zinc-400">
+                  Senha do mail.tm (só pra ler o email — NÃO use no xAI)
+                </Label>
+                <div className="flex gap-2">
+                  <Input
+                    readOnly
+                    type={showPassword ? "text" : "password"}
+                    value={state.mail.password}
+                    className="font-mono text-sm bg-zinc-950 border-zinc-800"
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={onTogglePassword}
+                    className="border-zinc-700"
+                  >
+                    {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                  </Button>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onCopy(state.mail!.password, "Senha mail.tm")}
+                  className="w-full border-zinc-700"
+                >
+                  <Copy className="size-3 mr-2" /> Copiar senha mail.tm
+                </Button>
+              </div>
+            </div>
+
+            <Alert className="border-amber-900/40 bg-amber-950/20">
+              <AlertCircle className="size-4 text-amber-400" />
+              <AlertDescription className="text-xs text-amber-200/80">
+                <b>Resumo:</b> No xAI você vai criar a conta com o email acima + uma senha que VOCÊ escolhe.
+                A senha do mail.tm mostrada aqui serve só pra você acessar a caixa de entrada se quiser ver os emails manualmente —
+                nós já vamos detectar os códigos automaticamente abaixo.
+              </AlertDescription>
+            </Alert>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* === STEP 3: Verification code (auto-detected) === */}
+      {isWaiting && (
+        <Card className={`bg-zinc-900/60 border-2 ${hasCode ? "border-emerald-500 shadow-lg shadow-emerald-500/20" : "border-zinc-800 border-dashed"}`}>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <span className={`size-6 rounded-full ${hasCode ? "bg-emerald-500" : "bg-zinc-700"} text-white text-xs font-bold flex items-center justify-center`}>3</span>
+              {hasCode ? (
+                <span className="flex items-center gap-2 text-emerald-300">
+                  <Key className="size-4" /> Código de verificação recebido!
+                </span>
+              ) : (
+                <span className="flex items-center gap-2 text-zinc-300">
+                  <Clock className="size-4 animate-pulse" /> Aguardando código de verificação do xAI…
+                </span>
+              )}
+            </CardTitle>
+            <CardDescription>
+              {hasCode
+                ? "Copie este código e cole na página do xAI."
+                : "Assim que o xAI enviar o código, vamos pegá-lo do mail.tm e mostrar aqui automaticamente."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {hasCode ? (
+              <div className="space-y-3">
+                <div className="flex gap-2">
+                  <Input
+                    readOnly
+                    value={state.latestCode || ""}
+                    className="font-mono text-3xl text-center tracking-[0.5em] font-bold bg-zinc-950 border-emerald-700 text-emerald-300 py-6"
+                  />
+                  <Button
+                    size="lg"
+                    onClick={() => onCopy(state.latestCode || "", "Código")}
+                    className="bg-emerald-600 hover:bg-emerald-500 px-6"
+                  >
+                    <Copy className="size-5" />
+                  </Button>
+                </div>
+                <p className="text-xs text-emerald-400/80 text-center">
+                  ✅ Detectado automaticamente do email recebido no mail.tm
+                </p>
+              </div>
+            ) : (
+              <div className="flex items-center justify-center py-8 gap-3 text-zinc-500">
+                <Loader2 className="size-5 animate-spin" />
+                <span className="text-sm">Checando inbox a cada 5s…</span>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* === STEP 4: Authorize === */}
+      {isWaiting && state.verificationUrl && (
+        <Card className="bg-zinc-900/60 border-zinc-800 border-amber-900/40">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <span className="size-6 rounded-full bg-amber-500/20 text-amber-300 text-xs font-bold flex items-center justify-center">4</span>
+              <CheckCircle2 className="size-4 text-amber-400" />
+              Depois de logado, clique em <span className="text-amber-300">"Allow"</span>
+            </CardTitle>
+            <CardDescription>
+              O xAI vai perguntar se você autoriza o <code className="text-zinc-300 bg-zinc-800 px-1 rounded">grok-proxy-cli</code> a
+              acessar sua conta. Clique em <b>Allow</b> e pronto — vamos detectar o token automaticamente.
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      )}
+
+      {/* Inbox messages (transparency) */}
+      {isWaiting && state.inbox.length > 0 && (
+        <Card className="bg-zinc-900/60 border-zinc-800">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <Mail className="size-4 text-zinc-400" />
+              Emails recebidos no mail.tm ({state.inbox.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ScrollArea className="max-h-64 rounded-md">
+              <div className="space-y-2">
+                {state.inbox.map((m) => (
+                  <div key={m.id} className="rounded-md border border-zinc-800 bg-zinc-950/40 p-3 text-xs">
+                    <div className="flex items-center justify-between gap-2 mb-1">
+                      <span className="font-mono text-zinc-400 truncate">{m.from}</span>
+                      {m.code && (
+                        <Badge variant="default" className="bg-emerald-600 text-white shrink-0">
+                          code: {m.code}
+                        </Badge>
+                      )}
+                    </div>
+                    <div className="text-zinc-200 font-medium mb-1">{m.subject}</div>
+                    <div className="text-zinc-500 line-clamp-2 font-mono text-[10px]">
+                      {m.text.slice(0, 200)}…
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </ScrollArea>
+          </CardContent>
+        </Card>
       )}
 
       {/* Success view */}
