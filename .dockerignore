@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+dev.log
+server.log
+download
+upload
+mini-services
+grok-proxy-cli
+scripts_py
+*.tar.gz
+.env*
