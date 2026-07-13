@@ -62,3 +62,4 @@ upload/
 dev.log
 server.log
 *.tar.gz
+bun.lock
