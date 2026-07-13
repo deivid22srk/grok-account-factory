@@ -1,27 +1,11 @@
-# Render Blueprint for grok-proxy-cli account factory web UI
+# Render Blueprint for grok-proxy-cli account factory web UI (static site)
 # Docs: https://render.com/docs/blueprint-spec
 services:
-  - type: web
+  - type: static
     name: grok-account-factory
-    runtime: node
-    plan: free
-    region: oregon
-    branch: main
-    rootDir: .
-    buildCommand: |
-      bun install --frozen-lockfile || bun install
-      bun run build
-    startCommand: bun .next/standalone/server.js
+    buildCommand: npm install && npm run build
+    publishPath: out
+    pullRequestPreviewsEnabled: false
     envVars:
       - key: NODE_ENV
         value: production
-      - key: HOSTNAME
-        value: 0.0.0.0
-      - key: PORT
-        value: 10000
-      - key: GROK_DATA_DIR
-        value: /data/GrokDesktop
-    disk:
-      name: grok-data
-      mountPath: /data
-      sizeGB: 1

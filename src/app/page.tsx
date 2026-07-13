@@ -9,7 +9,6 @@ import { Badge } from "@/components/ui/badge"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Skeleton } from "@/components/ui/skeleton"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Dialog,
@@ -23,156 +22,159 @@ import { useToast } from "@/hooks/use-toast"
 import { Toaster } from "@/components/ui/toaster"
 import {
   Plus, RefreshCw, Trash2, Star, Copy, ExternalLink, Key, Mail, Lock, Clock,
-  CheckCircle2, AlertCircle, Loader2, Zap, User, ZapIcon, Activity, Eye, EyeOff
+  CheckCircle2, AlertCircle, Loader2, Zap, User, Activity, Eye, EyeOff, Download,
 } from "lucide-react"
+import { TempMailClient, type TempMailAccount } from "@/lib/account-factory/tempmail-client"
+import { OAuthClient, type AccountInfo } from "@/lib/account-factory/oauth-client"
+import {
+  listAccounts, saveAccount, removeAccount, setActive, getActiveId,
+  refreshAccount, exportAccountAsGrokFormat, downloadAsFile, type StoredAccount,
+} from "@/lib/account-factory/store-client"
 
-interface AccountRow {
-  id: string
-  label: string
-  email: string
-  team_id: string
-  expires_at: string
-  expired: boolean
-  active: boolean
-  has_refresh_token: boolean
-  created_at: string
-  updated_at: string
-}
+type TabKey = "accounts" | "create"
+type CreateStatus = "idle" | "creating_email" | "awaiting_authorization" | "polling" | "saved" | "error"
 
-interface JobRow {
-  id: string
-  status: "creating_email" | "awaiting_authorization" | "polling" | "saved" | "error"
-  createdAt: number
-  updatedAt: number
-  email?: string
-  password?: string
+interface CreateState {
+  status: CreateStatus
+  mail?: TempMailAccount
   verificationUrl?: string
   userCode?: string
-  account?: any
+  account?: AccountInfo
   error?: string
 }
 
-type TabKey = "accounts" | "create"
-
 export default function Home() {
   const [tab, setTab] = useState<TabKey>("accounts")
-  const [accounts, setAccounts] = useState<AccountRow[]>([])
-  const [loadingAccounts, setLoadingAccounts] = useState(true)
-  const [dataDir, setDataDir] = useState("")
-  const { toast } = useToast()
-
-  // Active job (when creating)
-  const [activeJob, setActiveJob] = useState<JobRow | null>(null)
+  const [accounts, setAccounts] = useState<StoredAccount[]>([])
+  const [activeId, setActiveId] = useState("")
+  const [create, setCreate] = useState<CreateState>({ status: "idle" })
   const [showPassword, setShowPassword] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const { toast } = useToast()
   const pollRef = useRef<NodeJS.Timeout | null>(null)
+  const stopPollRef = useRef<boolean>(false)
 
-  const refreshAccounts = useCallback(async () => {
-    setLoadingAccounts(true)
-    try {
-      const r = await fetch("/api/accounts/list")
-      const data = await r.json()
-      if (data.error) throw new Error(data.error)
-      setAccounts(data.accounts || [])
-      setDataDir(data.data_dir || "")
-    } catch (e: any) {
-      toast({ title: "Erro ao carregar contas", description: e.message, variant: "destructive" })
-    } finally {
-      setLoadingAccounts(false)
-    }
-  }, [toast])
+  const refreshAccounts = useCallback(() => {
+    setAccounts(listAccounts())
+    setActiveId(getActiveId())
+  }, [])
 
   useEffect(() => {
     refreshAccounts()
   }, [refreshAccounts])
 
-  // Poll active job
+  // Cleanup polling on unmount
   useEffect(() => {
-    if (!activeJob) return
-    if (activeJob.status === "saved" || activeJob.status === "error") return
-    const poll = async () => {
-      try {
-        const r = await fetch(`/api/jobs/${activeJob.id}`)
-        const data = await r.json()
-        if (data.job) {
-          setActiveJob(data.job)
-          if (data.job.status === "saved") {
-            toast({ title: "Conta criada!", description: `Email: ${data.job.account?.email || data.job.email}` })
-            refreshAccounts()
-          } else if (data.job.status === "error") {
-            toast({ title: "Erro na criação", description: data.job.error, variant: "destructive" })
-          }
-        }
-      } catch {}
-    }
-    pollRef.current = setInterval(poll, 3000)
     return () => {
+      stopPollRef.current = true
       if (pollRef.current) clearInterval(pollRef.current)
     }
-  }, [activeJob, toast, refreshAccounts])
+  }, [])
 
   const handleCreate = async () => {
     setTab("create")
-    setActiveJob(null)
+    setCreate({ status: "creating_email" })
+    setBusy(true)
+    stopPollRef.current = false
+
     try {
-      const r = await fetch("/api/accounts/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ expires_in_sec: 1800 }),
-      })
-      const data = await r.json()
-      if (data.error) throw new Error(data.error)
-      setActiveJob(data.job)
-      toast({ title: "Sessão iniciada", description: "Aguardando autorização no xAI…" })
+      const mail = new TempMailClient()
+      const oauth = new OAuthClient()
+
+      // 1) temp email
+      const mailAcc = await mail.createAccount()
+      if (stopPollRef.current) return
+      setCreate((s) => ({ ...s, status: "awaiting_authorization", mail: mailAcc }))
+
+      // 2) start OAuth device flow
+      const start = await oauth.startDevice()
+      if (stopPollRef.current) return
+      setCreate((s) => ({
+        ...s,
+        status: "polling",
+        mail: mailAcc,
+        verificationUrl: start.verification_uri_complete,
+        userCode: start.user_code,
+      }))
+      toast({ title: "URL pronta — abra o link para autorizar" })
+
+      // 3) poll for token (in background, not awaited so UI stays responsive)
+      oauth
+        .pollDevice(start.device_code, start.interval, start.expires_in, () => {})
+        .then(async (tok) => {
+          if (stopPollRef.current) return
+          try {
+            const acc = await oauth.accountFromToken(tok)
+            if (!acc.email && mailAcc) acc.email = mailAcc.address
+            saveAccount(acc, true)
+            setCreate((s) => ({ ...s, status: "saved", account: acc }))
+            toast({ title: "Conta criada!", description: `Email: ${acc.email}` })
+            refreshAccounts()
+          } catch (e: any) {
+            setCreate((s) => ({ ...s, status: "error", error: e.message || String(e) }))
+            toast({ title: "Erro ao salvar", description: e.message, variant: "destructive" })
+          } finally {
+            setBusy(false)
+          }
+        })
+        .catch((e) => {
+          if (stopPollRef.current) return
+          setCreate((s) => ({ ...s, status: "error", error: e.message || String(e) }))
+          toast({ title: "OAuth falhou", description: e.message, variant: "destructive" })
+          setBusy(false)
+        })
     } catch (e: any) {
+      setCreate((s) => ({ ...s, status: "error", error: e.message || String(e) }))
       toast({ title: "Erro ao iniciar criação", description: e.message, variant: "destructive" })
+      setBusy(false)
     }
   }
 
-  const handleCancelJob = () => {
-    setActiveJob(null)
+  const handleCancelCreate = () => {
+    stopPollRef.current = true
+    if (pollRef.current) clearInterval(pollRef.current)
+    setCreate({ status: "idle" })
+    setBusy(false)
     setTab("accounts")
   }
 
-  const handleActivate = async (id: string) => {
-    try {
-      const r = await fetch(`/api/accounts/${id}/activate`, { method: "POST" })
-      const data = await r.json()
-      if (data.error) throw new Error(data.error)
-      toast({ title: "Conta ativada", description: id.slice(0, 16) + "…" })
+  const handleActivate = (id: string) => {
+    if (setActive(id)) {
       refreshAccounts()
-    } catch (e: any) {
-      toast({ title: "Erro", description: e.message, variant: "destructive" })
+      toast({ title: "Conta ativada" })
     }
   }
 
   const handleRefresh = async (id: string) => {
+    setBusy(true)
     try {
-      const r = await fetch(`/api/accounts/${id}/refresh`, { method: "POST" })
-      const data = await r.json()
-      if (data.error) throw new Error(data.error)
-      toast({ title: "Token renovado", description: id.slice(0, 16) + "…" })
+      await refreshAccount(id)
       refreshAccounts()
+      toast({ title: "Token renovado" })
     } catch (e: any) {
-      toast({ title: "Erro", description: e.message, variant: "destructive" })
+      toast({ title: "Erro ao renovar", description: e.message, variant: "destructive" })
+    } finally {
+      setBusy(false)
     }
   }
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = (id: string) => {
     if (!confirm(`Remover conta ${id.slice(0, 16)}…?`)) return
-    try {
-      const r = await fetch(`/api/accounts/${id}`, { method: "DELETE" })
-      const data = await r.json()
-      if (data.error) throw new Error(data.error)
-      toast({ title: "Conta removida" })
+    if (removeAccount(id)) {
       refreshAccounts()
-    } catch (e: any) {
-      toast({ title: "Erro", description: e.message, variant: "destructive" })
+      toast({ title: "Conta removida" })
     }
+  }
+
+  const handleExport = (acc: StoredAccount) => {
+    const json = exportAccountAsGrokFormat(acc)
+    downloadAsFile(`${acc.id}.json`, json)
+    toast({ title: "Conta exportada", description: `${acc.id}.json` })
   }
 
   const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text)
-    toast({ title: `${label} copiado`, description: text.slice(0, 60) + (text.length > 60 ? "…" : "") })
+    toast({ title: `${label} copiado` })
   }
 
   return (
@@ -182,7 +184,7 @@ export default function Home() {
         <div className="container mx-auto px-4 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="size-10 rounded-xl bg-gradient-to-br from-emerald-500 to-cyan-500 flex items-center justify-center shadow-lg shadow-emerald-500/20">
-              <ZapIcon className="size-5 text-white" />
+              <Zap className="size-5 text-white" />
             </div>
             <div>
               <h1 className="text-lg font-semibold tracking-tight">Grok Account Factory</h1>
@@ -190,11 +192,11 @@ export default function Home() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={refreshAccounts} disabled={loadingAccounts}>
-              <RefreshCw className={`size-4 mr-2 ${loadingAccounts ? "animate-spin" : ""}`} />
+            <Button variant="outline" size="sm" onClick={refreshAccounts}>
+              <RefreshCw className="size-4 mr-2" />
               Atualizar
             </Button>
-            <Button size="sm" onClick={handleCreate}>
+            <Button size="sm" onClick={handleCreate} disabled={busy}>
               <Plus className="size-4 mr-2" />
               Nova conta
             </Button>
@@ -207,7 +209,7 @@ export default function Home() {
         <Tabs value={tab} onValueChange={(v) => setTab(v as TabKey)} className="w-full">
           <TabsList className="grid w-full max-w-md grid-cols-2 bg-zinc-900/60 border border-zinc-800">
             <TabsTrigger value="accounts" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
-              <User className="size-4 mr-2" /> Contas
+              <User className="size-4 mr-2" /> Contas ({accounts.length})
             </TabsTrigger>
             <TabsTrigger value="create" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
               <Plus className="size-4 mr-2" /> Criar conta
@@ -223,16 +225,12 @@ export default function Home() {
                   Contas existentes
                 </CardTitle>
                 <CardDescription className="text-zinc-400">
-                  Lidas do store do grok-proxy-cli:{" "}
-                  <code className="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-xs">{dataDir || "—"}</code>
+                  Contas salvas neste navegador (localStorage). Use <b>Exportar</b> para baixar
+                  cada conta no formato do grok-proxy-cli (<code className="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-xs">~/.local/share/GrokDesktop/accounts/&lt;id&gt;.json</code>).
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                {loadingAccounts ? (
-                  <div className="space-y-2">
-                    {[1, 2, 3].map((i) => <Skeleton key={i} className="h-12 w-full bg-zinc-800" />)}
-                  </div>
-                ) : accounts.length === 0 ? (
+                {accounts.length === 0 ? (
                   <EmptyState onCreate={handleCreate} />
                 ) : (
                   <ScrollArea className="max-h-[60vh] rounded-md border border-zinc-800">
@@ -247,73 +245,85 @@ export default function Home() {
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {accounts.map((a) => (
-                          <TableRow key={a.id} className="border-zinc-800 hover:bg-zinc-800/40">
-                            <TableCell className="font-mono text-xs text-zinc-300">
-                              {a.id.slice(0, 16)}…
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex flex-col">
-                                <span className="text-sm">{a.email || "—"}</span>
-                                <span className="text-xs text-zinc-500">{a.label}</span>
-                              </div>
-                            </TableCell>
-                            <TableCell className="text-xs text-zinc-400">
-                              {a.expires_at ? new Date(a.expires_at).toLocaleString("pt-BR") : "—"}
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex flex-wrap gap-1">
-                                {a.active && (
-                                  <Badge variant="default" className="bg-emerald-600 hover:bg-emerald-600 text-white">
-                                    <Star className="size-3 mr-1" /> Ativa
-                                  </Badge>
-                                )}
-                                {a.expired ? (
-                                  <Badge variant="destructive">Expirada</Badge>
-                                ) : (
-                                  <Badge variant="secondary" className="bg-zinc-800 text-zinc-300">Válida</Badge>
-                                )}
-                                {a.has_refresh_token && (
-                                  <Badge variant="outline" className="border-zinc-700 text-zinc-400">
-                                    <Key className="size-3 mr-1" /> Refresh
-                                  </Badge>
-                                )}
-                              </div>
-                            </TableCell>
-                            <TableCell className="text-right">
-                              <div className="flex justify-end gap-1">
-                                <Button
-                                  size="sm"
-                                  variant="ghost"
-                                  onClick={() => handleActivate(a.id)}
-                                  disabled={a.active}
-                                  title="Ativar"
-                                  className="hover:bg-emerald-500/20 hover:text-emerald-300"
-                                >
-                                  <Star className="size-4" />
-                                </Button>
-                                <Button
-                                  size="sm"
-                                  variant="ghost"
-                                  onClick={() => handleRefresh(a.id)}
-                                  title="Renovar token"
-                                  className="hover:bg-cyan-500/20 hover:text-cyan-300"
-                                >
-                                  <RefreshCw className="size-4" />
-                                </Button>
-                                <Button
-                                  size="sm"
-                                  variant="ghost"
-                                  onClick={() => handleDelete(a.id)}
-                                  title="Remover"
-                                  className="hover:bg-red-500/20 hover:text-red-300"
-                                >
-                                  <Trash2 className="size-4" />
-                                </Button>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                        ))}
+                        {accounts.map((a) => {
+                          const expired = a.expires_at ? new Date(a.expires_at).getTime() < Date.now() : false
+                          return (
+                            <TableRow key={a.id} className="border-zinc-800 hover:bg-zinc-800/40">
+                              <TableCell className="font-mono text-xs text-zinc-300">
+                                {a.id.slice(0, 16)}…
+                              </TableCell>
+                              <TableCell>
+                                <div className="flex flex-col">
+                                  <span className="text-sm">{a.email || "—"}</span>
+                                  <span className="text-xs text-zinc-500">{a.label}</span>
+                                </div>
+                              </TableCell>
+                              <TableCell className="text-xs text-zinc-400">
+                                {a.expires_at ? new Date(a.expires_at).toLocaleString("pt-BR") : "—"}
+                              </TableCell>
+                              <TableCell>
+                                <div className="flex flex-wrap gap-1">
+                                  {a.id === activeId && (
+                                    <Badge variant="default" className="bg-emerald-600 hover:bg-emerald-600 text-white">
+                                      <Star className="size-3 mr-1" /> Ativa
+                                    </Badge>
+                                  )}
+                                  {expired ? (
+                                    <Badge variant="destructive">Expirada</Badge>
+                                  ) : (
+                                    <Badge variant="secondary" className="bg-zinc-800 text-zinc-300">Válida</Badge>
+                                  )}
+                                  {a.refresh_token && (
+                                    <Badge variant="outline" className="border-zinc-700 text-zinc-400">
+                                      <Key className="size-3 mr-1" /> Refresh
+                                    </Badge>
+                                  )}
+                                </div>
+                              </TableCell>
+                              <TableCell className="text-right">
+                                <div className="flex justify-end gap-1">
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={() => handleActivate(a.id)}
+                                    disabled={a.id === activeId}
+                                    title="Ativar"
+                                    className="hover:bg-emerald-500/20 hover:text-emerald-300"
+                                  >
+                                    <Star className="size-4" />
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={() => handleRefresh(a.id)}
+                                    title="Renovar token"
+                                    className="hover:bg-cyan-500/20 hover:text-cyan-300"
+                                  >
+                                    <RefreshCw className="size-4" />
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={() => handleExport(a)}
+                                    title="Exportar JSON"
+                                    className="hover:bg-amber-500/20 hover:text-amber-300"
+                                  >
+                                    <Download className="size-4" />
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={() => handleDelete(a.id)}
+                                    title="Remover"
+                                    className="hover:bg-red-500/20 hover:text-red-300"
+                                  >
+                                    <Trash2 className="size-4" />
+                                  </Button>
+                                </div>
+                              </TableCell>
+                            </TableRow>
+                          )
+                        })}
                       </TableBody>
                     </Table>
                   </ScrollArea>
@@ -324,7 +334,7 @@ export default function Home() {
 
           {/* Create tab */}
           <TabsContent value="create" className="mt-6">
-            {!activeJob ? (
+            {create.status === "idle" ? (
               <Card className="bg-zinc-900/60 border-zinc-800">
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
@@ -346,11 +356,11 @@ export default function Home() {
               </Card>
             ) : (
               <CreateJobPanel
-                job={activeJob}
+                state={create}
                 showPassword={showPassword}
                 onTogglePassword={() => setShowPassword(!showPassword)}
                 onCopy={copyToClipboard}
-                onCancel={handleCancelJob}
+                onCancel={handleCancelCreate}
               />
             )}
           </TabsContent>
@@ -390,7 +400,7 @@ function FlowSteps() {
     { n: 1, title: "Email temporário", desc: "Criamos um endereço @mail.tm para receber o código de verificação" },
     { n: 2, title: "OAuth device flow", desc: "Iniciamos o fluxo em auth.x.ai e obtemos um user_code" },
     { n: 3, title: "Você autoriza", desc: "Abrimos um link; você entra com o email temporário e autoriza o grok-proxy-cli" },
-    { n: 4, title: "Token salvo", desc: "Recebemos o access_token + refresh_token e gravamos no store" },
+    { n: 4, title: "Token salvo", desc: "Recebemos o access_token + refresh_token e gravamos no navegador" },
   ]
   return (
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -410,22 +420,22 @@ function FlowSteps() {
 }
 
 function CreateJobPanel({
-  job,
+  state,
   showPassword,
   onTogglePassword,
   onCopy,
   onCancel,
 }: {
-  job: JobRow
+  state: CreateState
   showPassword: boolean
   onTogglePassword: () => void
   onCopy: (text: string, label: string) => void
   onCancel: () => void
 }) {
-  const statusMeta = getStatusMeta(job.status)
-  const isDone = job.status === "saved"
-  const isError = job.status === "error"
-  const isWaiting = job.status === "awaiting_authorization" || job.status === "polling"
+  const statusMeta = getStatusMeta(state.status)
+  const isDone = state.status === "saved"
+  const isError = state.status === "error"
+  const isWaiting = state.status === "awaiting_authorization" || state.status === "polling" || state.status === "creating_email"
 
   return (
     <div className="space-y-6">
@@ -439,10 +449,10 @@ function CreateJobPanel({
             <div className="flex-1">
               <h3 className={`font-semibold ${statusMeta.titleColor}`}>{statusMeta.title}</h3>
               <p className={`text-sm ${statusMeta.descColor}`}>{statusMeta.desc}</p>
-              {isWaiting && (
+              {isWaiting && state.status !== "creating_email" && (
                 <div className="mt-2 flex items-center gap-2 text-xs text-zinc-400">
                   <Loader2 className="size-3 animate-spin" />
-                  Polling do OAuth a cada 5s…
+                  Polling do OAuth a cada 5s — aguardando autorização…
                 </div>
               )}
             </div>
@@ -450,51 +460,49 @@ function CreateJobPanel({
         </CardContent>
       </Card>
 
-      {/* Credentials + URL */}
-      {isWaiting && job.verificationUrl && (
-        <div className="grid gap-4 md:grid-cols-2">
-          {/* Verification URL */}
-          <Card className="bg-zinc-900/60 border-zinc-800 md:col-span-2 border-emerald-900/40">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <ExternalLink className="size-4 text-emerald-400" />
-                Passo 1 — Abra este link e autorize
-              </CardTitle>
-              <CardDescription>
-                Use o email e senha abaixo para entrar (ou criar conta) no xAI. Depois clique em "Allow".
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex flex-col sm:flex-row gap-2">
-                <Input
-                  readOnly
-                  value={job.verificationUrl}
-                  className="font-mono text-xs bg-zinc-950 border-zinc-800"
-                />
-                <Button
-                  variant="outline"
-                  onClick={() => onCopy(job.verificationUrl!, "URL")}
-                  className="border-zinc-700"
-                >
-                  <Copy className="size-4" />
-                </Button>
-                <Button
-                  asChild
-                  className="bg-emerald-600 hover:bg-emerald-500"
-                >
-                  <a href={job.verificationUrl} target="_blank" rel="noreferrer">
-                    Abrir <ExternalLink className="size-4 ml-1" />
-                  </a>
-                </Button>
-              </div>
-              <div className="rounded-md bg-zinc-950/60 border border-zinc-800 p-3 text-xs">
-                <span className="text-zinc-500">user_code:</span>{" "}
-                <code className="text-emerald-300 font-bold tracking-wider">{job.userCode}</code>
-              </div>
-            </CardContent>
-          </Card>
+      {/* Verification URL */}
+      {isWaiting && state.verificationUrl && (
+        <Card className="bg-zinc-900/60 border-zinc-800 border-emerald-900/40">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ExternalLink className="size-4 text-emerald-400" />
+              Passo 1 — Abra este link e autorize
+            </CardTitle>
+            <CardDescription>
+              Use o email e senha abaixo para entrar (ou criar conta) no xAI. Depois clique em "Allow".
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex flex-col sm:flex-row gap-2">
+              <Input
+                readOnly
+                value={state.verificationUrl}
+                className="font-mono text-xs bg-zinc-950 border-zinc-800"
+              />
+              <Button
+                variant="outline"
+                onClick={() => onCopy(state.verificationUrl!, "URL")}
+                className="border-zinc-700"
+              >
+                <Copy className="size-4" />
+              </Button>
+              <Button asChild className="bg-emerald-600 hover:bg-emerald-500">
+                <a href={state.verificationUrl} target="_blank" rel="noreferrer">
+                  Abrir <ExternalLink className="size-4 ml-1" />
+                </a>
+              </Button>
+            </div>
+            <div className="rounded-md bg-zinc-950/60 border border-zinc-800 p-3 text-xs">
+              <span className="text-zinc-500">user_code:</span>{" "}
+              <code className="text-emerald-300 font-bold tracking-wider">{state.userCode}</code>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
-          {/* Email */}
+      {/* Email + password */}
+      {isWaiting && state.mail && (
+        <div className="grid gap-4 md:grid-cols-2">
           <Card className="bg-zinc-900/60 border-zinc-800">
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-base">
@@ -505,13 +513,13 @@ function CreateJobPanel({
             <CardContent className="space-y-2">
               <Input
                 readOnly
-                value={job.email || ""}
+                value={state.mail.address}
                 className="font-mono text-sm bg-zinc-950 border-zinc-800"
               />
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => onCopy(job.email || "", "Email")}
+                onClick={() => onCopy(state.mail!.address, "Email")}
                 className="w-full border-zinc-700"
               >
                 <Copy className="size-3 mr-2" /> Copiar email
@@ -519,7 +527,6 @@ function CreateJobPanel({
             </CardContent>
           </Card>
 
-          {/* Password */}
           <Card className="bg-zinc-900/60 border-zinc-800">
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-base">
@@ -532,7 +539,7 @@ function CreateJobPanel({
                 <Input
                   readOnly
                   type={showPassword ? "text" : "password"}
-                  value={job.password || ""}
+                  value={state.mail.password}
                   className="font-mono text-sm bg-zinc-950 border-zinc-800"
                 />
                 <Button
@@ -547,7 +554,7 @@ function CreateJobPanel({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => onCopy(job.password || "", "Senha")}
+                onClick={() => onCopy(state.mail!.password, "Senha")}
                 className="w-full border-zinc-700"
               >
                 <Copy className="size-3 mr-2" /> Copiar senha
@@ -558,23 +565,27 @@ function CreateJobPanel({
       )}
 
       {/* Success view */}
-      {isDone && job.account && (
+      {isDone && state.account && (
         <Card className="bg-emerald-950/40 border-emerald-900/60">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-emerald-300">
               <CheckCircle2 className="size-5" /> Conta criada e salva!
             </CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2 text-sm">
+          <CardContent className="space-y-3 text-sm">
             <div className="grid grid-cols-3 gap-2">
               <div className="col-span-1 text-zinc-400">ID</div>
-              <div className="col-span-2 font-mono text-xs">{job.account.id}</div>
+              <div className="col-span-2 font-mono text-xs">{state.account.id}</div>
               <div className="col-span-1 text-zinc-400">Email</div>
-              <div className="col-span-2">{job.account.email || job.email}</div>
+              <div className="col-span-2">{state.account.email}</div>
               <div className="col-span-1 text-zinc-400">Team</div>
-              <div className="col-span-2 font-mono text-xs">{job.account.team_id || "—"}</div>
+              <div className="col-span-2 font-mono text-xs">{state.account.team_id || "—"}</div>
               <div className="col-span-1 text-zinc-400">Expira</div>
-              <div className="col-span-2">{new Date(job.account.expires_at).toLocaleString("pt-BR")}</div>
+              <div className="col-span-2">{new Date(state.account.expires_at).toLocaleString("pt-BR")}</div>
+            </div>
+            <div className="pt-3 border-t border-emerald-900/40 text-xs text-emerald-400/80">
+              ✅ A conta foi salva no navegador. Volte para a aba <b>Contas</b> para exportá-la no
+              formato do grok-proxy-cli.
             </div>
           </CardContent>
         </Card>
@@ -585,7 +596,7 @@ function CreateJobPanel({
         <Alert variant="destructive">
           <AlertCircle className="size-4" />
           <AlertTitle>Erro</AlertTitle>
-          <AlertDescription className="font-mono text-xs">{job.error}</AlertDescription>
+          <AlertDescription className="font-mono text-xs break-all">{state.error}</AlertDescription>
         </Alert>
       )}
 
@@ -598,7 +609,7 @@ function CreateJobPanel({
   )
 }
 
-function getStatusMeta(status: JobRow["status"]) {
+function getStatusMeta(status: CreateStatus) {
   switch (status) {
     case "creating_email":
       return {
@@ -639,7 +650,7 @@ function getStatusMeta(status: JobRow["status"]) {
     case "saved":
       return {
         title: "Conta criada com sucesso!",
-        desc: "Token salvo no store do grok-proxy-cli",
+        desc: "Token salvo no navegador",
         icon: <CheckCircle2 className="size-5" />,
         bg: "bg-emerald-950/40 border-emerald-900/60",
         border: "border-emerald-900/60",
@@ -659,6 +670,18 @@ function getStatusMeta(status: JobRow["status"]) {
         iconColor: "text-red-300",
         titleColor: "text-red-200",
         descColor: "text-red-400/80",
+      }
+    default:
+      return {
+        title: "",
+        desc: "",
+        icon: <Loader2 className="size-5" />,
+        bg: "",
+        border: "",
+        iconBg: "",
+        iconColor: "",
+        titleColor: "",
+        descColor: "",
       }
   }
 }

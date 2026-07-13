@@ -1,7 +1,9 @@
 /**
- * OAuth 2.0 device-code flow for xAI — TypeScript port of account_factory/oauth_flow.py
+ * Browser-side OAuth 2.0 device-code flow for xAI.
  *
- * Talks directly to auth.x.ai (pure JSON API), so it works from any IP.
+ * Talks to auth.x.ai via a CORS proxy (because auth.x.ai doesn't send
+ * CORS headers). Default proxy is proxy.cors.sh which is free for low
+ * volume. You can override via the CORS_PROXY env var or localStorage.
  */
 
 export const DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -9,6 +11,35 @@ export const DEFAULT_ISSUER = "https://auth.x.ai";
 export const DEFAULT_SCOPES =
   "openid profile email offline_access api:access grok-cli:access conversations:read conversations:write";
 export const DEFAULT_CLIENT_VERSION = "0.2.93";
+
+// Public CORS proxies that allow POST with form-urlencoded body.
+// Tried in order until one succeeds.
+const CORS_PROXIES = [
+  "https://proxy.cors.sh/",
+  "https://corsproxy.io/?url=",
+];
+
+function getCorsProxy(): string {
+  if (typeof localStorage !== "undefined") {
+    const stored = localStorage.getItem("cors_proxy");
+    if (stored) return stored;
+  }
+  return CORS_PROXIES[0];
+}
+
+export function setCorsProxy(proxy: string) {
+  if (typeof localStorage !== "undefined") {
+    localStorage.setItem("cors_proxy", proxy);
+  }
+}
+
+function wrapWithProxy(url: string, proxy?: string): string {
+  const p = proxy || getCorsProxy();
+  if (p.endsWith("?url=") || p.includes("?url=")) {
+    return p + encodeURIComponent(url);
+  }
+  return p + url;
+}
 
 export interface DeviceStart {
   device_code: string;
@@ -34,7 +65,7 @@ export interface AccountInfo {
   team_id: string;
   access_token: string;
   refresh_token: string;
-  expires_at: string; // ISO
+  expires_at: string;
   client_id: string;
   issuer: string;
   scope: string;
@@ -68,21 +99,15 @@ export class OAuthClient {
       client_id: this.clientId,
       scope: this.scopes,
     });
-    const r = await fetch(`${this.issuer}/oauth2/device/code`, {
-      method: "POST",
-      headers: this.headers(),
-      body,
-    });
-    if (!r.ok) throw new Error(`device/code HTTP ${r.status}: ${await r.text()}`);
-    const d = await r.json();
-    if (!d.device_code || !d.user_code) throw new Error(`invalid device/code response: ${JSON.stringify(d)}`);
+    const data = await this.postFormViaProxy(`${this.issuer}/oauth2/device/code`, body);
+    if (!data.device_code || !data.user_code) throw new Error(`invalid device/code response: ${JSON.stringify(data)}`);
     return {
-      device_code: d.device_code,
-      user_code: d.user_code,
-      verification_uri: d.verification_uri,
-      verification_uri_complete: d.verification_uri_complete || d.verification_uri,
-      expires_in: d.expires_in ?? 1800,
-      interval: d.interval ?? 5,
+      device_code: data.device_code,
+      user_code: data.user_code,
+      verification_uri: data.verification_uri,
+      verification_uri_complete: data.verification_uri_complete || data.verification_uri,
+      expires_in: data.expires_in ?? 1800,
+      interval: data.interval ?? 5,
     };
   }
 
@@ -101,12 +126,7 @@ export class OAuthClient {
           device_code: deviceCode,
           client_id: this.clientId,
         });
-        const r = await fetch(`${this.issuer}/oauth2/token`, {
-          method: "POST",
-          headers: this.headers(),
-          body,
-        });
-        const resp: any = await r.json().catch(() => ({}));
+        const resp: any = await this.postFormViaProxy(`${this.issuer}/oauth2/token`, body, true);
         const err = resp.error;
         if (err) {
           if (err === "authorization_pending") {
@@ -121,13 +141,6 @@ export class OAuthClient {
           }
           throw new Error(`${err}: ${resp.error_description || ""}`);
         }
-        if (r.status >= 400) {
-          if ((await r.text()).includes("authorization_pending")) {
-            await new Promise((r) => setTimeout(r, currentInterval * 1000));
-            continue;
-          }
-          throw new Error(`HTTP ${r.status}: ${await r.text()}`);
-        }
         if (!resp.access_token) {
           await new Promise((r) => setTimeout(r, currentInterval * 1000));
           continue;
@@ -140,6 +153,7 @@ export class OAuthClient {
           scope: resp.scope || this.scopes,
         };
       } catch (e: any) {
+        // network errors from proxy can happen — keep polling
         onTick?.(`network error: ${e.message}`);
         await new Promise((r) => setTimeout(r, currentInterval * 1000));
       }
@@ -153,13 +167,7 @@ export class OAuthClient {
       refresh_token: refreshToken,
       client_id: this.clientId,
     });
-    const r = await fetch(`${this.issuer}/oauth2/token`, {
-      method: "POST",
-      headers: this.headers(),
-      body,
-    });
-    if (!r.ok) throw new Error(`refresh HTTP ${r.status}: ${await r.text()}`);
-    const resp: any = await r.json();
+    const resp: any = await this.postFormViaProxy(`${this.issuer}/oauth2/token`, body);
     if (resp.error) throw new Error(`${resp.error}: ${resp.error_description || ""}`);
     return {
       access_token: resp.access_token,
@@ -192,7 +200,8 @@ export class OAuthClient {
     let payload = parts[1];
     payload += "=".repeat((4 - (payload.length % 4)) % 4);
     try {
-      const json = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
+      // Browser-compatible base64url decode
+      const json = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
       return { teamId: json.team_id || "", sub: json.sub || "" };
     } catch {
       return { teamId: "", sub: "" };
@@ -216,5 +225,35 @@ export class OAuthClient {
       issuer: this.issuer,
       scope: tok.scope,
     };
+  }
+
+  private async postFormViaProxy(url: string, body: URLSearchParams, tolerateErrors = false): Promise<any> {
+    // Try each known proxy until one works
+    let lastErr: any;
+    for (const proxy of CORS_PROXIES) {
+      try {
+        const proxiedUrl = wrapWithProxy(url, proxy);
+        const r = await fetch(proxiedUrl, {
+          method: "POST",
+          headers: this.headers(),
+          body,
+        });
+        const text = await r.text();
+        if (!r.ok && !tolerateErrors) {
+          lastErr = new Error(`HTTP ${r.status} via ${proxy}: ${text.slice(0, 200)}`);
+          continue;
+        }
+        try {
+          return JSON.parse(text);
+        } catch {
+          lastErr = new Error(`non-JSON via ${proxy}: ${text.slice(0, 200)}`);
+          continue;
+        }
+      } catch (e: any) {
+        lastErr = e;
+        continue;
+      }
+    }
+    throw lastErr || new Error("all CORS proxies failed");
   }
 }

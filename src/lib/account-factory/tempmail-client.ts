@@ -1,5 +1,6 @@
 /**
- * Temp mail client (mail.tm API) — TypeScript port of account_factory/tempmail.py
+ * Browser-side temp mail client (mail.tm API).
+ * CORS: mail.tm returns Access-Control-Allow-Origin: * so this works from any origin.
  */
 export interface TempMailAccount {
   address: string;
@@ -12,8 +13,10 @@ const MAIL_TM_BASE = "https://api.mail.tm";
 
 function randomString(len: number, charset: string = "abcdefghijklmnopqrstuvwxyz0123456789") {
   let out = "";
+  const arr = new Uint8Array(len);
+  crypto.getRandomValues(arr);
   for (let i = 0; i < len; i++) {
-    out += charset[Math.floor(Math.random() * charset.length)];
+    out += charset[arr[i] % charset.length];
   }
   return out;
 }
@@ -53,7 +56,6 @@ export class TempMailClient {
     }
     const body = await r.json();
     const accountId = body.id || "";
-
     const token = await this.loginWithRetry(address, password);
     return { address, password, token, accountId };
   }
@@ -116,15 +118,6 @@ export class TempMailClient {
       await new Promise((r) => setTimeout(r, pollIntervalMs));
     }
     return null;
-  }
-
-  async deleteAccount(acc: TempMailAccount): Promise<void> {
-    try {
-      await fetch(`${this.base}/accounts/${acc.accountId}`, {
-        method: "DELETE",
-        headers: { ...this.headers, Authorization: `Bearer ${acc.token}` },
-      });
-    } catch {}
   }
 
   private async loginWithRetry(address: string, password: string, attempts = 8, delayMs = 1500): Promise<string> {
