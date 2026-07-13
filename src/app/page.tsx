@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback, useRef } from "react"
+import { useEffect, useState, useCallback, useRef, useMemo } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -32,20 +32,20 @@ import { Toaster } from "@/components/ui/toaster"
 import {
   Plus, RefreshCw, Trash2, Star, Copy, ExternalLink, Key, Clock,
   CheckCircle2, AlertCircle, Loader2, Zap, User, Activity, Download,
-  Terminal, RotateCw, AlertTriangle,
+  Terminal, RotateCw, AlertTriangle, Server, Globe, Cpu,
 } from "lucide-react"
 import { OAuthClient, type AccountInfo } from "@/lib/account-factory/oauth-client"
 import {
   listAccounts, saveAccount, removeAccount, setActive, getActiveId,
   refreshAccount, exportAccountAsGrokFormat, downloadAsFile, markLimited,
-  markAvailable, rotateToNextAvailable, type StoredAccount,
+  markAvailable, rotateToNextAvailable, exportAllAsJson, type StoredAccount,
 } from "@/lib/account-factory/store-client"
 import {
   log, logInfo, logSuccess, logWarn, logError, logDebug,
   getLogs, clearLogs, subscribeLogs, type LogEntry, type LogLevel,
 } from "@/lib/account-factory/logger"
 
-type TabKey = "accounts" | "add" | "logs"
+type TabKey = "accounts" | "add" | "proxy" | "logs"
 type AddStatus = "idle" | "starting" | "awaiting_authorization" | "polling" | "saved" | "error"
 
 interface AddState {
@@ -337,16 +337,19 @@ export default function Home() {
       {/* Main content */}
       <main className="flex-1 container mx-auto px-4 py-6">
         <Tabs value={tab} onValueChange={(v) => setTab(v as TabKey)} className="w-full">
-          <TabsList className="grid w-full max-w-md grid-cols-3 bg-zinc-900/60 border border-zinc-800">
+          <TabsList className="grid w-full max-w-2xl grid-cols-4 bg-zinc-900/60 border border-zinc-800">
             <TabsTrigger value="accounts" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
-              <User className="size-4 mr-2" /> Contas
+              <User className="size-4 mr-1.5" /> Contas
               <span className="ml-1 text-xs text-zinc-500">({accounts.length})</span>
             </TabsTrigger>
             <TabsTrigger value="add" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
-              <Plus className="size-4 mr-2" /> Adicionar
+              <Plus className="size-4 mr-1.5" /> Adicionar
+            </TabsTrigger>
+            <TabsTrigger value="proxy" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
+              <Server className="size-4 mr-1.5" /> Proxy
             </TabsTrigger>
             <TabsTrigger value="logs" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
-              <Terminal className="size-4 mr-2" /> Logs
+              <Terminal className="size-4 mr-1.5" /> Logs
             </TabsTrigger>
           </TabsList>
 
@@ -593,6 +596,15 @@ export default function Home() {
                 onCancel={handleCancelAdd}
               />
             )}
+          </TabsContent>
+
+          {/* ===== Proxy tab ===== */}
+          <TabsContent value="proxy" className="mt-6">
+            <ProxyPanel
+              accounts={accounts}
+              onCopy={copyToClipboard}
+              onToast={toast}
+            />
           </TabsContent>
 
           {/* ===== Logs tab ===== */}
@@ -869,6 +881,366 @@ function getAddStatusMeta(status: AddStatus) {
         descColor: "",
       }
   }
+}
+
+// ============================================================
+//  Proxy Panel — how to run the grok-proxy-cli with your accounts
+// ============================================================
+function ProxyPanel({
+  accounts,
+  onCopy,
+  onToast,
+}: {
+  accounts: StoredAccount[]
+  onCopy: (text: string, label: string) => void
+  onToast: (t: { title: string; description?: string; variant?: "default" | "destructive" }) => void
+}) {
+  const [proxyUrl, setProxyUrl] = useState("http://localhost:8787")
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string; data?: any } | null>(null)
+
+  // Build the GROK_ACCOUNTS_JSON payload from all stored accounts
+  const accountsJson = useMemo(() => {
+    const clean = accounts.map((a) => ({
+      id: a.id,
+      label: a.label,
+      email: a.email,
+      team_id: a.team_id,
+      user_id: a.user_id,
+      access_token: a.access_token,
+      refresh_token: a.refresh_token,
+      expires_at: a.expires_at,
+      client_id: a.client_id,
+      issuer: a.issuer,
+      scope: a.scope,
+      created_at: a.created_at,
+      updated_at: a.updated_at,
+    }))
+    return JSON.stringify(clean)
+  }, [accounts])
+
+  const dockerCmd = useMemo(() => {
+    // Single-line JSON for the env var
+    const oneLine = accountsJson.replace(/\s+/g, " ")
+    return `docker run --rm -p 8787:10000 \\
+  -e GROK_ACCOUNTS_JSON='${oneLine}' \\
+  -e GROK_DATA_DIR=/data/GrokDesktop \\
+  ghcr.io/deivid22srk/grok-proxy-cli:latest`
+  }, [accountsJson])
+
+  const binaryCmd = useMemo(() => {
+    const oneLine = accountsJson.replace(/\s+/g, " ")
+    return `# Linux/macOS
+GROK_ACCOUNTS_JSON='${oneLine}' ./grok-proxy-cli serve --listen 0.0.0.0:8787
+
+# Or write accounts to disk first:
+mkdir -p ~/.local/share/GrokDesktop/accounts/
+# ... save each account JSON as ~/.local/share/GrokDesktop/accounts/<id>.json
+./grok-proxy-cli serve`
+  }, [accountsJson])
+
+  const testProxy = async () => {
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const r = await fetch(`${proxyUrl.replace(/\/$/, "")}/v1/models`, {
+        headers: { Authorization: "Bearer test" },
+      })
+      const text = await r.text()
+      let data: any = null
+      try { data = JSON.parse(text) } catch {}
+      if (r.ok) {
+        setTestResult({
+          ok: true,
+          msg: `HTTP ${r.status} — proxy está respondendo`,
+          data,
+        })
+        onToast({ title: "Proxy OK", description: `${data?.data?.length || 0} modelos disponíveis` })
+      } else {
+        setTestResult({
+          ok: false,
+          msg: `HTTP ${r.status}: ${text.slice(0, 200)}`,
+          data,
+        })
+        onToast({ title: "Proxy respondeu com erro", description: `HTTP ${r.status}`, variant: "destructive" })
+      }
+    } catch (e: any) {
+      setTestResult({ ok: false, msg: e.message || String(e) })
+      onToast({ title: "Não foi possível conectar", description: e.message, variant: "destructive" })
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Why no proxy on Render */}
+      <Alert className="border-amber-900/40 bg-amber-950/20">
+        <AlertTriangle className="size-4 text-amber-400" />
+        <AlertTitle className="text-amber-200">Por que o proxy não está rodando no Render?</AlertTitle>
+        <AlertDescription className="text-amber-200/80 text-sm">
+          O Render free tier exige cartão de crédito para criar novos <b>web services</b> (a partir de julho/2026).
+          Por isso a Web UI roda como static site (grátis), mas o proxy Go precisa rodar em outro lugar.
+          <b> As contas que você adiciona aqui ficam salvas no seu navegador</b> — use uma das opções abaixo para rodar o proxy.
+        </AlertDescription>
+      </Alert>
+
+      {/* Test your proxy */}
+      <Card className="bg-zinc-900/60 border-zinc-800">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Globe className="size-5 text-cyan-400" />
+            Testar proxy existente
+          </CardTitle>
+          <CardDescription>
+            Se você já tem o grok-proxy-cli rodando em algum lugar, teste a conexão aqui.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex gap-2">
+            <Input
+              value={proxyUrl}
+              onChange={(e) => setProxyUrl(e.target.value)}
+              placeholder="http://localhost:8787 ou https://meu-proxy.com"
+              className="font-mono text-sm bg-zinc-950 border-zinc-800"
+            />
+            <Button onClick={testProxy} disabled={testing}>
+              {testing ? <Loader2 className="size-4 animate-spin" /> : <Zap className="size-4 mr-2" />}
+              {testing ? "Testando…" : "Testar /v1/models"}
+            </Button>
+          </div>
+          {testResult && (
+            <Alert variant={testResult.ok ? "default" : "destructive"} className={testResult.ok ? "border-emerald-900/40 bg-emerald-950/20" : ""}>
+              <div className="flex items-start gap-2">
+                {testResult.ok ? <CheckCircle2 className="size-4 text-emerald-400 mt-0.5" /> : <AlertCircle className="size-4 mt-0.5" />}
+                <div className="flex-1 min-w-0">
+                  <AlertTitle className={testResult.ok ? "text-emerald-300" : ""}>{testResult.msg}</AlertTitle>
+                  {testResult.data?.data && (
+                    <AlertDescription className="text-xs mt-1">
+                      <b>Modelos disponíveis:</b> {testResult.data.data.map((m: any) => m.id).join(", ")}
+                    </AlertDescription>
+                  )}
+                </div>
+              </div>
+            </Alert>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Option 1: Docker one-liner */}
+      <Card className="bg-zinc-900/60 border-zinc-800">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Cpu className="size-5 text-emerald-400" />
+            Opção 1 — Docker (recomendado)
+          </CardTitle>
+          <CardDescription>
+            Roda em qualquer máquina com Docker. As contas são injetadas via{" "}
+            <code className="text-zinc-300 bg-zinc-800 px-1 rounded text-xs">GROK_ACCOUNTS_JSON</code>.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {accounts.length === 0 ? (
+            <Alert>
+              <AlertCircle className="size-4" />
+              <AlertDescription>
+                Adicione contas primeiro (aba <b>Adicionar</b>). O comando Docker abaixo será preenchido automaticamente.
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <>
+              <pre className="text-xs bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto text-zinc-200 whitespace-pre-wrap break-all">
+                {dockerCmd}
+              </pre>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onCopy(dockerCmd, "Comando Docker")}
+                  className="border-zinc-700"
+                >
+                  <Copy className="size-3 mr-2" /> Copiar comando
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    downloadAsFile("grok-accounts.json", accountsJson)
+                    onToast({ title: "accounts.json baixado" })
+                  }}
+                  className="border-zinc-700"
+                >
+                  <Download className="size-3 mr-2" /> Baixar GROK_ACCOUNTS_JSON
+                </Button>
+              </div>
+              <p className="text-xs text-zinc-500">
+                Depois de rodar, o proxy ficará disponível em <code className="text-zinc-300 bg-zinc-800 px-1 rounded">http://localhost:8787/v1</code>.
+                Teste com o card acima.
+              </p>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Option 2: Binary */}
+      <Card className="bg-zinc-900/60 border-zinc-800">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Download className="size-5 text-cyan-400" />
+            Opção 2 — Baixar binário
+          </CardTitle>
+          <CardDescription>
+            Compilado com suporte a <code className="text-zinc-300 bg-zinc-800 px-1 rounded text-xs">GROK_ACCOUNTS_JSON</code> (build tag <code className="text-zinc-300 bg-zinc-800 px-1 rounded text-xs">render</code>).
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-2 sm:grid-cols-2">
+            <DownloadLink
+              os="Linux amd64"
+              url="https://github.com/deivid22srk/grok-proxy-cli/releases/download/v1.1.0-render/grok-proxy-cli-linux-amd64"
+            />
+            <DownloadLink
+              os="Linux arm64"
+              url="https://github.com/deivid22srk/grok-proxy-cli/releases/download/v1.1.0-render/grok-proxy-cli-linux-arm64"
+            />
+            <DownloadLink
+              os="macOS Intel"
+              url="https://github.com/deivid22srk/grok-proxy-cli/releases/download/v1.1.0-render/grok-proxy-cli-darwin-amd64"
+            />
+            <DownloadLink
+              os="macOS Apple Silicon"
+              url="https://github.com/deivid22srk/grok-proxy-cli/releases/download/v1.1.0-render/grok-proxy-cli-darwin-arm64"
+            />
+            <DownloadLink
+              os="Windows amd64"
+              url="https://github.com/deivid22srk/grok-proxy-cli/releases/download/v1.1.0-render/grok-proxy-cli-windows-amd64.exe"
+            />
+          </div>
+          {accounts.length > 0 && (
+            <>
+              <div>
+                <Label className="text-xs text-zinc-400">Comando para rodar (Linux/macOS):</Label>
+                <pre className="mt-1 text-xs bg-zinc-950 border border-zinc-800 rounded-md p-3 overflow-x-auto text-zinc-200 whitespace-pre-wrap break-all">
+                  {binaryCmd}
+                </pre>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onCopy(binaryCmd, "Comando binário")}
+                className="border-zinc-700"
+              >
+                <Copy className="size-3 mr-2" /> Copiar comando
+              </Button>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Option 3: Deploy on free hosts */}
+      <Card className="bg-zinc-900/60 border-zinc-800">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Server className="size-5 text-amber-400" />
+            Opção 3 — Deploy em host free (sem cartão)
+          </CardTitle>
+          <CardDescription>
+            O Render exige cartão para web services. Alternativas free sem cartão:
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          <div className="space-y-2">
+            <div className="flex items-start gap-2">
+              <span className="size-5 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">1</span>
+              <div className="flex-1">
+                <b className="text-zinc-200">Koyeb</b> — free Docker, sem cartão.
+                <br />
+                <a href="https://www.koyeb.com/" target="_blank" rel="noreferrer" className="text-emerald-400 hover:underline text-xs">
+                  https://www.koyeb.com/ → New Service → GitHub → grok-proxy-cli → Docker
+                </a>
+              </div>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="size-5 rounded-full bg-cyan-500/20 text-cyan-300 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">2</span>
+              <div className="flex-1">
+                <b className="text-zinc-200">Hugging Face Spaces</b> — free Docker space.
+                <br />
+                <a href="https://huggingface.co/new-space" target="_blank" rel="noreferrer" className="text-emerald-400 hover:underline text-xs">
+                  https://huggingface.co/new-space → SDK: Docker → clone grok-proxy-cli
+                </a>
+              </div>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className="size-5 rounded-full bg-amber-500/20 text-amber-300 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">3</span>
+              <div className="flex-1">
+                <b className="text-zinc-200">Fly.io</b> — trial free, pede cartão mas não cobra.
+                <br />
+                <a href="https://fly.io/" target="_blank" rel="noreferrer" className="text-emerald-400 hover:underline text-xs">
+                  https://fly.io/ → install flyctl → fly launch
+                </a>
+              </div>
+            </div>
+          </div>
+          <Alert className="border-zinc-800 bg-zinc-950/40">
+            <AlertDescription className="text-xs text-zinc-400">
+              Em qualquer um desses, defina a env var{" "}
+              <code className="text-zinc-300 bg-zinc-800 px-1 rounded">GROK_ACCOUNTS_JSON</code> com o JSON
+              que você pode copiar/baixar acima. O proxy vai subir em ~30s.
+            </AlertDescription>
+          </Alert>
+        </CardContent>
+      </Card>
+
+      {/* Quick env var reference */}
+      <Card className="bg-zinc-900/60 border-zinc-800">
+        <CardHeader>
+          <CardTitle className="text-sm">Referência rápida — env vars</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <Table>
+            <TableHeader>
+              <TableRow className="border-zinc-800">
+                <TableHead className="text-zinc-400">Variável</TableHead>
+                <TableHead className="text-zinc-400">Valor padrão</TableHead>
+                <TableHead className="text-zinc-400">Descrição</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              <TableRow className="border-zinc-800">
+                <TableCell className="font-mono text-xs text-emerald-300">GROK_ACCOUNTS_JSON</TableCell>
+                <TableCell className="font-mono text-xs">[]</TableCell>
+                <TableCell className="text-xs">JSON array de contas. Vazio = sem contas.</TableCell>
+              </TableRow>
+              <TableRow className="border-zinc-800">
+                <TableCell className="font-mono text-xs text-emerald-300">GROK_DATA_DIR</TableCell>
+                <TableCell className="font-mono text-xs">~/.local/share/GrokDesktop</TableCell>
+                <TableCell className="text-xs">Diretório onde as contas são gravadas.</TableCell>
+              </TableRow>
+              <TableRow className="border-zinc-800">
+                <TableCell className="font-mono text-xs text-emerald-300">PORT</TableCell>
+                <TableCell className="font-mono text-xs">10000</TableCell>
+                <TableCell className="text-xs">Porta do container (Render/HF).</TableCell>
+              </TableRow>
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function DownloadLink({ os, url }: { os: string; url: string }) {
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noreferrer"
+      className="flex items-center justify-between rounded-md border border-zinc-800 bg-zinc-950/60 px-3 py-2 hover:border-emerald-700 hover:bg-emerald-950/20 transition-colors group"
+    >
+      <span className="text-sm text-zinc-200">{os}</span>
+      <Download className="size-4 text-zinc-500 group-hover:text-emerald-400" />
+    </a>
+  )
 }
 
 // ============================================================
