@@ -11,244 +11,237 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { useToast } from "@/hooks/use-toast"
 import { Toaster } from "@/components/ui/toaster"
 import {
-  Plus, RefreshCw, Trash2, Star, Copy, ExternalLink, Key, Mail, Lock, Clock,
-  CheckCircle2, AlertCircle, Loader2, Zap, User, Activity, Eye, EyeOff, Download,
+  Plus, RefreshCw, Trash2, Star, Copy, ExternalLink, Key, Clock,
+  CheckCircle2, AlertCircle, Loader2, Zap, User, Activity, Download,
+  Terminal, RotateCw, AlertTriangle,
 } from "lucide-react"
-import { TempMailClient, extractCodeFromEmail, type TempMailAccount } from "@/lib/account-factory/tempmail-client"
 import { OAuthClient, type AccountInfo } from "@/lib/account-factory/oauth-client"
 import {
   listAccounts, saveAccount, removeAccount, setActive, getActiveId,
-  refreshAccount, exportAccountAsGrokFormat, downloadAsFile, type StoredAccount,
+  refreshAccount, exportAccountAsGrokFormat, downloadAsFile, markLimited,
+  markAvailable, rotateToNextAvailable, type StoredAccount,
 } from "@/lib/account-factory/store-client"
+import {
+  log, logInfo, logSuccess, logWarn, logError, logDebug,
+  getLogs, clearLogs, subscribeLogs, type LogEntry, type LogLevel,
+} from "@/lib/account-factory/logger"
 
-type TabKey = "accounts" | "create"
-type CreateStatus = "idle" | "creating_email" | "awaiting_authorization" | "polling" | "saved" | "error"
+type TabKey = "accounts" | "add" | "logs"
+type AddStatus = "idle" | "starting" | "awaiting_authorization" | "polling" | "saved" | "error"
 
-interface InboxMessage {
-  id: string
-  from: string
-  subject: string
-  text: string
-  date: string
-  code?: string | null
-}
-
-interface CreateState {
-  status: CreateStatus
-  mail?: TempMailAccount
+interface AddState {
+  status: AddStatus
   verificationUrl?: string
   userCode?: string
   account?: AccountInfo
   error?: string
-  inbox: InboxMessage[]
-  latestCode?: string | null
+  startedAt?: number
 }
 
 export default function Home() {
   const [tab, setTab] = useState<TabKey>("accounts")
   const [accounts, setAccounts] = useState<StoredAccount[]>([])
   const [activeId, setActiveId] = useState("")
-  const [create, setCreate] = useState<CreateState>({ status: "idle", inbox: [] })
-  const [showPassword, setShowPassword] = useState(false)
+  const [add, setAdd] = useState<AddState>({ status: "idle" })
   const [busy, setBusy] = useState(false)
+  const [removeTarget, setRemoveTarget] = useState<StoredAccount | null>(null)
   const { toast } = useToast()
-  const pollRef = useRef<NodeJS.Timeout | null>(null)
-  const inboxRef = useRef<NodeJS.Timeout | null>(null)
   const stopPollRef = useRef<boolean>(false)
 
   const refreshAccounts = useCallback(() => {
-    setAccounts(listAccounts())
+    const accs = listAccounts()
+    setAccounts(accs)
     setActiveId(getActiveId())
   }, [])
 
   useEffect(() => {
     refreshAccounts()
+    logInfo("system", "Web UI inicializada", { accounts: listAccounts().length })
   }, [refreshAccounts])
 
-  // Cleanup polling on unmount
+  // Auto-refresh active account info every 30s (to update expiry/limited state)
+  useEffect(() => {
+    const t = setInterval(() => {
+      rotateToNextAvailable() // auto-clear expired limits, rotate if current is limited
+      refreshAccounts()
+    }, 30_000)
+    return () => clearInterval(t)
+  }, [refreshAccounts])
+
   useEffect(() => {
     return () => {
       stopPollRef.current = true
-      if (pollRef.current) clearInterval(pollRef.current)
-      if (inboxRef.current) clearInterval(inboxRef.current)
     }
   }, [])
 
-  const handleCreate = async () => {
-    setTab("create")
-    setCreate({ status: "creating_email", inbox: [] })
+  const handleAddAccount = async () => {
+    setTab("add")
+    setAdd({ status: "starting", startedAt: Date.now() })
     setBusy(true)
     stopPollRef.current = false
 
     try {
-      const mail = new TempMailClient()
       const oauth = new OAuthClient()
+      logInfo("oauth", "Iniciando device-code flow em auth.x.ai")
 
-      // 1) temp email
-      const mailAcc = await mail.createAccount()
-      if (stopPollRef.current) return
-      setCreate((s) => ({ ...s, status: "awaiting_authorization", mail: mailAcc, inbox: [] }))
-
-      // 2) start OAuth device flow
       const start = await oauth.startDevice()
       if (stopPollRef.current) return
-      setCreate((s) => ({
-        ...s,
-        status: "polling",
-        mail: mailAcc,
+      setAdd({
+        status: "awaiting_authorization",
         verificationUrl: start.verification_uri_complete,
         userCode: start.user_code,
-        inbox: [],
-      }))
-      toast({ title: "Tudo pronto — siga as instruções abaixo" })
+        startedAt: Date.now(),
+      })
+      logSuccess("oauth", `Device code obtido: ${start.user_code}`, { url: start.verification_uri_complete })
+      toast({ title: "Link pronto — abra para autorizar" })
 
-      // 3) start inbox polling in parallel — auto-detect verification codes
-      startInboxPolling(mailAcc)
-
-      // 4) poll for token (in background, not awaited so UI stays responsive)
+      // Poll for token in background
+      setAdd((s) => ({ ...s, status: "polling" }))
       oauth
-        .pollDevice(start.device_code, start.interval, start.expires_in, () => {})
+        .pollDevice(start.device_code, start.interval, start.expires_in, (msg) => {
+          logDebug("oauth", msg)
+        })
         .then(async (tok) => {
           if (stopPollRef.current) return
           try {
+            logInfo("oauth", "Token recebido, buscando userinfo…")
             const acc = await oauth.accountFromToken(tok)
-            if (!acc.email && mailAcc) acc.email = mailAcc.address
             saveAccount(acc, true)
-            setCreate((s) => ({ ...s, status: "saved", account: acc }))
-            toast({ title: "Conta criada!", description: `Email: ${acc.email}` })
+            setAdd((s) => ({ ...s, status: "saved", account: acc }))
+            logSuccess("oauth", `Conta salva: ${acc.email || acc.id}`, { id: acc.id, email: acc.email })
+            toast({ title: "Conta adicionada!", description: acc.email || acc.id.slice(0, 16) })
             refreshAccounts()
-            stopInboxPolling()
           } catch (e: any) {
-            setCreate((s) => ({ ...s, status: "error", error: e.message || String(e) }))
-            toast({ title: "Erro ao salvar", description: e.message, variant: "destructive" })
-            stopInboxPolling()
+            const msg = e.message || String(e)
+            setAdd((s) => ({ ...s, status: "error", error: msg }))
+            logError("oauth", `Erro ao salvar token: ${msg}`)
+            toast({ title: "Erro ao salvar", description: msg, variant: "destructive" })
           } finally {
             setBusy(false)
           }
         })
         .catch((e) => {
           if (stopPollRef.current) return
-          setCreate((s) => ({ ...s, status: "error", error: e.message || String(e) }))
-          toast({ title: "OAuth falhou", description: e.message, variant: "destructive" })
-          stopInboxPolling()
+          const msg = e.message || String(e)
+          setAdd((s) => ({ ...s, status: "error", error: msg }))
+          logError("oauth", `Polling falhou: ${msg}`)
+          toast({ title: "OAuth falhou", description: msg, variant: "destructive" })
           setBusy(false)
         })
     } catch (e: any) {
-      setCreate((s) => ({ ...s, status: "error", error: e.message || String(e) }))
-      toast({ title: "Erro ao iniciar criação", description: e.message, variant: "destructive" })
+      const msg = e.message || String(e)
+      setAdd((s) => ({ ...s, status: "error", error: msg }))
+      logError("oauth", `Erro ao iniciar: ${msg}`)
+      toast({ title: "Erro ao iniciar", description: msg, variant: "destructive" })
       setBusy(false)
     }
   }
 
-  // Poll the mail.tm inbox every 5s and surface new messages + extracted codes
-  const startInboxPolling = (mailAcc: TempMailAccount) => {
-    stopInboxPolling()
-    const mail = new TempMailClient()
-    const seen = new Set<string>()
-    let latestCode: string | null = null
-
-    const tick = async () => {
-      if (stopPollRef.current) {
-        stopInboxPolling()
-        return
-      }
-      try {
-        const inbox = await mail.fetchInbox(mailAcc)
-        const newMessages: InboxMessage[] = []
-        for (const msg of inbox) {
-          const id = msg.id || (msg["@id"] || "").split("/").pop()
-          if (!id || seen.has(id)) continue
-          seen.add(id)
-          const full = await mail.getMessage(mailAcc, id)
-          const body = (full.text || "") + "\n" + (full.html || "")
-          const code = extractCodeFromEmail(body)
-          newMessages.push({
-            id,
-            from: typeof full.from === "object" && full.from ? full.from.address || "" : String(full.from || ""),
-            subject: full.subject || "",
-            text: full.text || "",
-            date: full.createdAt || new Date().toISOString(),
-            code,
-          })
-          if (code && !latestCode) {
-            latestCode = code
-            toast({ title: "Código recebido!", description: code })
-          }
-        }
-        if (newMessages.length > 0) {
-          setCreate((s) => {
-            const merged = [...newMessages, ...s.inbox]
-            const newLatest = latestCode || s.latestCode
-            return { ...s, inbox: merged, latestCode: newLatest }
-          })
-        }
-      } catch (e) {
-        // network hiccup, retry next tick
-      }
-    }
-
-    // Run immediately + every 5s
-    tick()
-    inboxRef.current = setInterval(tick, 5000)
-  }
-
-  const stopInboxPolling = () => {
-    if (inboxRef.current) {
-      clearInterval(inboxRef.current)
-      inboxRef.current = null
-    }
-  }
-
-  const handleCancelCreate = () => {
+  const handleCancelAdd = () => {
     stopPollRef.current = true
-    if (pollRef.current) clearInterval(pollRef.current)
-    stopInboxPolling()
-    setCreate({ status: "idle", inbox: [] })
+    setAdd({ status: "idle" })
     setBusy(false)
+    logWarn("oauth", "Criação de conta cancelada pelo usuário")
     setTab("accounts")
   }
 
   const handleActivate = (id: string) => {
     if (setActive(id)) {
       refreshAccounts()
+      logInfo("store", `Conta ativada: ${id.slice(0, 16)}`)
       toast({ title: "Conta ativada" })
     }
   }
 
   const handleRefresh = async (id: string) => {
     setBusy(true)
+    logInfo("store", `Renovando token da conta ${id.slice(0, 16)}…`)
     try {
       await refreshAccount(id)
       refreshAccounts()
+      logSuccess("store", `Token renovado: ${id.slice(0, 16)}`)
       toast({ title: "Token renovado" })
     } catch (e: any) {
+      logError("store", `Erro ao renovar: ${e.message}`)
       toast({ title: "Erro ao renovar", description: e.message, variant: "destructive" })
     } finally {
       setBusy(false)
     }
   }
 
-  const handleDelete = (id: string) => {
-    if (!confirm(`Remover conta ${id.slice(0, 16)}…?`)) return
+  const handleMarkLimited = (id: string, reason: string) => {
+    markLimited(id, reason, new Date(Date.now() + 5 * 60 * 1000)) // 5 min cooldown
+    refreshAccounts()
+    logWarn("store", `Conta marcada como limitada: ${id.slice(0, 16)}`, { reason })
+    // Trigger auto-rotation
+    const newId = rotateToNextAvailable()
+    if (newId && newId !== id) {
+      refreshAccounts()
+      logInfo("store", `Auto-rotacionado para: ${newId.slice(0, 16)}`)
+      toast({ title: "Conta limitada — rotacionado", description: `Nova ativa: ${newId.slice(0, 16)}` })
+    } else {
+      toast({ title: "Conta marcada como limitada" })
+    }
+  }
+
+  const handleMarkAvailable = (id: string) => {
+    markAvailable(id)
+    refreshAccounts()
+    logInfo("store", `Conta liberada: ${id.slice(0, 16)}`)
+    toast({ title: "Conta liberada" })
+  }
+
+  const handleRotate = () => {
+    const currentId = getActiveId()
+    // Mark current as limited to force rotation
+    if (currentId) {
+      markLimited(currentId, "manual_rotation", new Date(Date.now() + 5 * 60 * 1000))
+    }
+    const newId = rotateToNextAvailable()
+    refreshAccounts()
+    if (newId) {
+      logInfo("store", `Rotação manual: ${currentId?.slice(0, 16)} → ${newId.slice(0, 16)}`)
+      toast({ title: "Rotacionado", description: `Nova ativa: ${newId.slice(0, 16)}` })
+    } else {
+      logWarn("store", "Rotação falhou — nenhuma conta disponível")
+      toast({ title: "Sem contas disponíveis", variant: "destructive" })
+    }
+  }
+
+  const handleConfirmRemove = () => {
+    if (!removeTarget) return
+    const id = removeTarget.id
     if (removeAccount(id)) {
       refreshAccounts()
+      logWarn("store", `Conta removida: ${id.slice(0, 16)}`)
       toast({ title: "Conta removida" })
     }
+    setRemoveTarget(null)
   }
 
   const handleExport = (acc: StoredAccount) => {
     const json = exportAccountAsGrokFormat(acc)
     downloadAsFile(`${acc.id}.json`, json)
+    logInfo("store", `Conta exportada: ${acc.id}.json`)
     toast({ title: "Conta exportada", description: `${acc.id}.json` })
   }
 
@@ -256,6 +249,11 @@ export default function Home() {
     navigator.clipboard.writeText(text)
     toast({ title: `${label} copiado` })
   }
+
+  // Find the active account object (with full details)
+  const activeAccount = accounts.find((a) => a.id === activeId)
+  const limitedCount = accounts.filter((a) => a.limited && (!a.limited_until || new Date(a.limited_until).getTime() > Date.now())).length
+  const expiredCount = accounts.filter((a) => a.expires_at && new Date(a.expires_at).getTime() < Date.now()).length
 
   return (
     <div className="min-h-screen flex flex-col bg-gradient-to-br from-zinc-950 via-zinc-900 to-zinc-950 text-zinc-100">
@@ -268,7 +266,7 @@ export default function Home() {
             </div>
             <div>
               <h1 className="text-lg font-semibold tracking-tight">Grok Account Factory</h1>
-              <p className="text-xs text-zinc-400">Criação e gestão de contas para grok-proxy-cli</p>
+              <p className="text-xs text-zinc-400">Gestão de contas para grok-proxy-cli</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -276,79 +274,197 @@ export default function Home() {
               <RefreshCw className="size-4 mr-2" />
               Atualizar
             </Button>
-            <Button size="sm" onClick={handleCreate} disabled={busy}>
+            <Button size="sm" onClick={handleAddAccount} disabled={busy}>
               <Plus className="size-4 mr-2" />
-              Nova conta
+              Adicionar conta
             </Button>
           </div>
         </div>
       </header>
 
+      {/* Active account banner (sticky below header) */}
+      {activeAccount && (
+        <div className="border-b border-zinc-800/80 bg-gradient-to-r from-emerald-950/60 to-cyan-950/40">
+          <div className="container mx-auto px-4 py-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="size-9 rounded-full bg-emerald-500/20 flex items-center justify-center shrink-0">
+                  <Star className="size-4 text-emerald-400" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs text-emerald-400/80 font-semibold uppercase tracking-wide">Conta ativa</span>
+                    {activeAccount.limited && (
+                      <Badge variant="destructive" className="text-[10px] py-0">LIMITADA</Badge>
+                    )}
+                  </div>
+                  <div className="text-sm font-medium text-zinc-100 truncate">
+                    {activeAccount.email || activeAccount.label}
+                  </div>
+                  <div className="text-xs text-zinc-400 font-mono truncate">
+                    {activeAccount.id.slice(0, 24)}…
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleRotate}
+                  disabled={accounts.length < 2}
+                  className="border-zinc-700 hover:bg-zinc-800"
+                  title="Pular para a próxima conta disponível"
+                >
+                  <RotateCw className="size-3.5 mr-1.5" />
+                  Rotacionar
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => handleRefresh(activeAccount.id)}
+                  disabled={busy}
+                  className="border-zinc-700 hover:bg-zinc-800"
+                >
+                  <RefreshCw className="size-3.5 mr-1.5" />
+                  Renovar
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Main content */}
       <main className="flex-1 container mx-auto px-4 py-6">
         <Tabs value={tab} onValueChange={(v) => setTab(v as TabKey)} className="w-full">
-          <TabsList className="grid w-full max-w-md grid-cols-2 bg-zinc-900/60 border border-zinc-800">
+          <TabsList className="grid w-full max-w-md grid-cols-3 bg-zinc-900/60 border border-zinc-800">
             <TabsTrigger value="accounts" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
-              <User className="size-4 mr-2" /> Contas ({accounts.length})
+              <User className="size-4 mr-2" /> Contas
+              <span className="ml-1 text-xs text-zinc-500">({accounts.length})</span>
             </TabsTrigger>
-            <TabsTrigger value="create" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
-              <Plus className="size-4 mr-2" /> Criar conta
+            <TabsTrigger value="add" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
+              <Plus className="size-4 mr-2" /> Adicionar
+            </TabsTrigger>
+            <TabsTrigger value="logs" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-300">
+              <Terminal className="size-4 mr-2" /> Logs
             </TabsTrigger>
           </TabsList>
 
-          {/* Accounts tab */}
-          <TabsContent value="accounts" className="mt-6">
+          {/* ===== Accounts tab ===== */}
+          <TabsContent value="accounts" className="mt-6 space-y-4">
+            {/* Summary cards */}
+            <div className="grid gap-3 sm:grid-cols-3">
+              <Card className="bg-zinc-900/60 border-zinc-800">
+                <CardContent className="pt-5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-2xl font-bold text-emerald-400">{accounts.length}</div>
+                      <div className="text-xs text-zinc-500">Total de contas</div>
+                    </div>
+                    <User className="size-8 text-zinc-700" />
+                  </div>
+                </CardContent>
+              </Card>
+              <Card className="bg-zinc-900/60 border-zinc-800">
+                <CardContent className="pt-5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-2xl font-bold text-amber-400">{limitedCount}</div>
+                      <div className="text-xs text-zinc-500">Limitadas</div>
+                    </div>
+                    <AlertTriangle className="size-8 text-zinc-700" />
+                  </div>
+                </CardContent>
+              </Card>
+              <Card className="bg-zinc-900/60 border-zinc-800">
+                <CardContent className="pt-5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-2xl font-bold text-red-400">{expiredCount}</div>
+                      <div className="text-xs text-zinc-500">Expiradas</div>
+                    </div>
+                    <Clock className="size-8 text-zinc-700" />
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+
+            {/* Accounts table */}
             <Card className="bg-zinc-900/60 border-zinc-800">
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   <Activity className="size-5 text-emerald-400" />
-                  Contas existentes
+                  Contas
                 </CardTitle>
                 <CardDescription className="text-zinc-400">
-                  Contas salvas neste navegador (localStorage). Use <b>Exportar</b> para baixar
-                  cada conta no formato do grok-proxy-cli (<code className="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-xs">~/.local/share/GrokDesktop/accounts/&lt;id&gt;.json</code>).
+                  Clique em <Star className="inline size-3" /> para ativar uma conta. Use <Download className="inline size-3" /> para exportar no formato do grok-proxy-cli (<code className="text-zinc-300 bg-zinc-800 px-1 rounded text-xs">~/.local/share/GrokDesktop/accounts/&lt;id&gt;.json</code>).
                 </CardDescription>
               </CardHeader>
               <CardContent>
                 {accounts.length === 0 ? (
-                  <EmptyState onCreate={handleCreate} />
+                  <EmptyState onAdd={handleAddAccount} />
                 ) : (
                   <ScrollArea className="max-h-[60vh] rounded-md border border-zinc-800">
                     <Table>
                       <TableHeader>
                         <TableRow className="bg-zinc-900 hover:bg-zinc-900 border-zinc-800">
-                          <TableHead className="text-zinc-400">ID</TableHead>
+                          <TableHead className="text-zinc-400 w-8"></TableHead>
                           <TableHead className="text-zinc-400">Email / Label</TableHead>
-                          <TableHead className="text-zinc-400">Expira</TableHead>
+                          <TableHead className="text-zinc-400">ID</TableHead>
                           <TableHead className="text-zinc-400">Status</TableHead>
+                          <TableHead className="text-zinc-400">Expira</TableHead>
                           <TableHead className="text-zinc-400 text-right">Ações</TableHead>
                         </TableRow>
                       </TableHeader>
                       <TableBody>
                         {accounts.map((a) => {
                           const expired = a.expires_at ? new Date(a.expires_at).getTime() < Date.now() : false
+                          const isActive = a.id === activeId
+                          const isLimited = a.limited && (!a.limited_until || new Date(a.limited_until).getTime() > Date.now())
                           return (
-                            <TableRow key={a.id} className="border-zinc-800 hover:bg-zinc-800/40">
+                            <TableRow
+                              key={a.id}
+                              className={`border-zinc-800 ${isActive ? "bg-emerald-950/20" : "hover:bg-zinc-800/40"}`}
+                            >
+                              <TableCell>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => handleActivate(a.id)}
+                                  disabled={isActive}
+                                  title={isActive ? "Já é a ativa" : "Ativar"}
+                                  className="hover:bg-emerald-500/20 hover:text-emerald-300 p-1"
+                                >
+                                  <Star className={`size-4 ${isActive ? "fill-emerald-400 text-emerald-400" : ""}`} />
+                                </Button>
+                              </TableCell>
+                              <TableCell>
+                                <div className="flex flex-col">
+                                  <span className="text-sm font-medium">{a.email || "—"}</span>
+                                  <span className="text-xs text-zinc-500">{a.label}</span>
+                                  {a.last_used && (
+                                    <span className="text-[10px] text-zinc-600">
+                                      usado: {new Date(a.last_used).toLocaleString("pt-BR")}
+                                    </span>
+                                  )}
+                                </div>
+                              </TableCell>
                               <TableCell className="font-mono text-xs text-zinc-300">
                                 {a.id.slice(0, 16)}…
                               </TableCell>
                               <TableCell>
-                                <div className="flex flex-col">
-                                  <span className="text-sm">{a.email || "—"}</span>
-                                  <span className="text-xs text-zinc-500">{a.label}</span>
-                                </div>
-                              </TableCell>
-                              <TableCell className="text-xs text-zinc-400">
-                                {a.expires_at ? new Date(a.expires_at).toLocaleString("pt-BR") : "—"}
-                              </TableCell>
-                              <TableCell>
                                 <div className="flex flex-wrap gap-1">
-                                  {a.id === activeId && (
+                                  {isActive && (
                                     <Badge variant="default" className="bg-emerald-600 hover:bg-emerald-600 text-white">
-                                      <Star className="size-3 mr-1" /> Ativa
+                                      <Star className="size-3 mr-1 fill-white" /> Ativa
                                     </Badge>
                                   )}
-                                  {expired ? (
+                                  {isLimited ? (
+                                    <Badge variant="destructive" title={a.limited_reason}>
+                                      <AlertTriangle className="size-3 mr-1" />
+                                      {a.limited_reason || "Limitada"}
+                                    </Badge>
+                                  ) : expired ? (
                                     <Badge variant="destructive">Expirada</Badge>
                                   ) : (
                                     <Badge variant="secondary" className="bg-zinc-800 text-zinc-300">Válida</Badge>
@@ -360,24 +476,17 @@ export default function Home() {
                                   )}
                                 </div>
                               </TableCell>
+                              <TableCell className="text-xs text-zinc-400">
+                                {a.expires_at ? new Date(a.expires_at).toLocaleString("pt-BR") : "—"}
+                              </TableCell>
                               <TableCell className="text-right">
-                                <div className="flex justify-end gap-1">
-                                  <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    onClick={() => handleActivate(a.id)}
-                                    disabled={a.id === activeId}
-                                    title="Ativar"
-                                    className="hover:bg-emerald-500/20 hover:text-emerald-300"
-                                  >
-                                    <Star className="size-4" />
-                                  </Button>
+                                <div className="flex justify-end gap-0.5">
                                   <Button
                                     size="sm"
                                     variant="ghost"
                                     onClick={() => handleRefresh(a.id)}
                                     title="Renovar token"
-                                    className="hover:bg-cyan-500/20 hover:text-cyan-300"
+                                    className="hover:bg-cyan-500/20 hover:text-cyan-300 p-1.5"
                                   >
                                     <RefreshCw className="size-4" />
                                   </Button>
@@ -386,16 +495,37 @@ export default function Home() {
                                     variant="ghost"
                                     onClick={() => handleExport(a)}
                                     title="Exportar JSON"
-                                    className="hover:bg-amber-500/20 hover:text-amber-300"
+                                    className="hover:bg-amber-500/20 hover:text-amber-300 p-1.5"
                                   >
                                     <Download className="size-4" />
                                   </Button>
+                                  {isLimited ? (
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => handleMarkAvailable(a.id)}
+                                      title="Marcar como disponível"
+                                      className="hover:bg-emerald-500/20 hover:text-emerald-300 p-1.5"
+                                    >
+                                      <CheckCircle2 className="size-4" />
+                                    </Button>
+                                  ) : (
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      onClick={() => handleMarkLimited(a.id, "manual")}
+                                      title="Marcar como limitada (força rotação)"
+                                      className="hover:bg-amber-500/20 hover:text-amber-300 p-1.5"
+                                    >
+                                      <AlertTriangle className="size-4" />
+                                    </Button>
+                                  )}
                                   <Button
                                     size="sm"
                                     variant="ghost"
-                                    onClick={() => handleDelete(a.id)}
-                                    title="Remover"
-                                    className="hover:bg-red-500/20 hover:text-red-300"
+                                    onClick={() => setRemoveTarget(a)}
+                                    title="Remover conta"
+                                    className="hover:bg-red-500/20 hover:text-red-300 p-1.5"
                                   >
                                     <Trash2 className="size-4" />
                                   </Button>
@@ -412,37 +542,62 @@ export default function Home() {
             </Card>
           </TabsContent>
 
-          {/* Create tab */}
-          <TabsContent value="create" className="mt-6">
-            {create.status === "idle" ? (
+          {/* ===== Add account tab ===== */}
+          <TabsContent value="add" className="mt-6">
+            {add.status === "idle" ? (
               <Card className="bg-zinc-900/60 border-zinc-800">
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <Plus className="size-5 text-emerald-400" />
-                    Criar nova conta
+                    Adicionar nova conta
                   </CardTitle>
                   <CardDescription className="text-zinc-400">
-                    Inicia o fluxo: email temporário (mail.tm) + OAuth device-code (auth.x.ai).
-                    Você verá um link e credenciais para autorizar a conta no xAI.
+                    Gera um link de autorização no xAI. Você abre, faz login com sua conta xAI
+                    existente (ou cria uma nova), e autoriza o <code className="text-zinc-300 bg-zinc-800 px-1 rounded text-xs">grok-proxy-cli</code>.
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-6">
-                  <FlowSteps />
-                  <Button onClick={handleCreate} size="lg" className="w-full bg-emerald-600 hover:bg-emerald-500">
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-4">
+                      <div className="flex items-center gap-2 mb-2">
+                        <div className="size-7 rounded-full bg-emerald-500/20 text-emerald-300 text-sm font-bold flex items-center justify-center">1</div>
+                        <h4 className="text-sm font-medium text-zinc-200">Gerar link</h4>
+                      </div>
+                      <p className="text-xs text-zinc-500">Iniciamos o OAuth device flow em auth.x.ai e te damos um link + código.</p>
+                    </div>
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-4">
+                      <div className="flex items-center gap-2 mb-2">
+                        <div className="size-7 rounded-full bg-cyan-500/20 text-cyan-300 text-sm font-bold flex items-center justify-center">2</div>
+                        <h4 className="text-sm font-medium text-zinc-200">Você autoriza</h4>
+                      </div>
+                      <p className="text-xs text-zinc-500">Abre o link, faz login no xAI (ou cria conta), clica em "Allow".</p>
+                    </div>
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-4">
+                      <div className="flex items-center gap-2 mb-2">
+                        <div className="size-7 rounded-full bg-amber-500/20 text-amber-300 text-sm font-bold flex items-center justify-center">3</div>
+                        <h4 className="text-sm font-medium text-zinc-200">Token salvo</h4>
+                      </div>
+                      <p className="text-xs text-zinc-500">Detectamos o token automaticamente e salvamos no navegador.</p>
+                    </div>
+                  </div>
+                  <Button onClick={handleAddAccount} size="lg" className="w-full bg-emerald-600 hover:bg-emerald-500">
                     <Zap className="size-4 mr-2" />
-                    Iniciar criação de conta
+                    Gerar link de autorização
                   </Button>
                 </CardContent>
               </Card>
             ) : (
-              <CreateJobPanel
-                state={create}
-                showPassword={showPassword}
-                onTogglePassword={() => setShowPassword(!showPassword)}
+              <AddAccountPanel
+                state={add}
                 onCopy={copyToClipboard}
-                onCancel={handleCancelCreate}
+                onCancel={handleCancelAdd}
               />
             )}
+          </TabsContent>
+
+          {/* ===== Logs tab ===== */}
+          <TabsContent value="logs" className="mt-6">
+            <LogsPanel />
           </TabsContent>
         </Tabs>
       </main>
@@ -453,11 +608,40 @@ export default function Home() {
         </div>
       </footer>
       <Toaster />
+
+      {/* Remove confirm dialog */}
+      <AlertDialog open={!!removeTarget} onOpenChange={(o) => !o && setRemoveTarget(null)}>
+        <AlertDialogContent className="bg-zinc-900 border-zinc-800">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-zinc-100">Remover conta?</AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400">
+              {removeTarget && (
+                <>
+                  Você vai remover a conta <b className="text-zinc-200">{removeTarget.email || removeTarget.label}</b>
+                  {" "}(<code className="text-zinc-300">{removeTarget.id.slice(0, 16)}…</code>) do navegador.
+                  <br /><br />
+                  <span className="text-amber-400">⚠️ Isso não remove a conta do xAI — apenas apaga o token salvo localmente.</span>
+                  {" "}Se quiser usar a conta de novo, basta adicionar novamente.
+                </>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-zinc-700">Cancelar</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleConfirmRemove}
+              className="bg-red-600 hover:bg-red-500"
+            >
+              <Trash2 className="size-4 mr-2" /> Remover
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
 
-function EmptyState({ onCreate }: { onCreate: () => void }) {
+function EmptyState({ onAdd }: { onAdd: () => void }) {
   return (
     <div className="flex flex-col items-center justify-center py-12 text-center">
       <div className="size-16 rounded-full bg-zinc-800/60 flex items-center justify-center mb-4">
@@ -465,75 +649,49 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
       </div>
       <h3 className="text-lg font-semibold text-zinc-300 mb-1">Nenhuma conta configurada</h3>
       <p className="text-sm text-zinc-500 mb-4 max-w-md">
-        Clique no botão abaixo para iniciar a criação automática de uma conta xAI.
-        Você vai receber um email temporário e um link de autorização.
+        Adicione sua primeira conta xAI. Vamos gerar um link de autorização —
+        você abre, faz login no xAI, e nós salvamos o token.
       </p>
-      <Button onClick={onCreate} className="bg-emerald-600 hover:bg-emerald-500">
-        <Plus className="size-4 mr-2" /> Criar primeira conta
+      <Button onClick={onAdd} className="bg-emerald-600 hover:bg-emerald-500">
+        <Plus className="size-4 mr-2" /> Adicionar primeira conta
       </Button>
     </div>
   )
 }
 
-function FlowSteps() {
-  const steps = [
-    { n: 1, title: "Email temporário", desc: "Criamos um endereço @mail.tm para receber o código de verificação do xAI" },
-    { n: 2, title: "Você cria a conta xAI", desc: "Abre o link, clica em Sign up, usa o email temporário e ESCOLHE SUA PRÓPRIA senha" },
-    { n: 3, title: "Código auto-detectado", desc: "xAI envia o código de verificação → pegamos do mail.tm automaticamente e te mostramos" },
-    { n: 4, title: "Token salvo", desc: "Você autoriza o grok-proxy-cli → recebemos o access_token + refresh_token" },
-  ]
-  return (
-    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-      {steps.map((s) => (
-        <div key={s.n} className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
-          <div className="flex items-center gap-2 mb-1">
-            <div className="size-6 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-bold flex items-center justify-center">
-              {s.n}
-            </div>
-            <h4 className="text-sm font-medium text-zinc-200">{s.title}</h4>
-          </div>
-          <p className="text-xs text-zinc-500">{s.desc}</p>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function CreateJobPanel({
+function AddAccountPanel({
   state,
-  showPassword,
-  onTogglePassword,
   onCopy,
   onCancel,
 }: {
-  state: CreateState
-  showPassword: boolean
-  onTogglePassword: () => void
+  state: AddState
   onCopy: (text: string, label: string) => void
   onCancel: () => void
 }) {
-  const statusMeta = getStatusMeta(state.status)
+  const meta = getAddStatusMeta(state.status)
   const isDone = state.status === "saved"
   const isError = state.status === "error"
-  const isWaiting = state.status === "awaiting_authorization" || state.status === "polling" || state.status === "creating_email"
-  const hasCode = !!state.latestCode
+  const isWaiting = state.status === "awaiting_authorization" || state.status === "polling" || state.status === "starting"
+  const elapsed = state.startedAt ? Math.floor((Date.now() - state.startedAt) / 1000) : 0
 
   return (
     <div className="space-y-6">
       {/* Status banner */}
-      <Card className={`${statusMeta.bg} ${statusMeta.border}`}>
+      <Card className={`${meta.bg} ${meta.border}`}>
         <CardContent className="pt-6">
           <div className="flex items-start gap-4">
-            <div className={`${statusMeta.iconBg} ${statusMeta.iconColor} size-10 rounded-full flex items-center justify-center flex-shrink-0`}>
-              {statusMeta.icon}
+            <div className={`${meta.iconBg} ${meta.iconColor} size-10 rounded-full flex items-center justify-center flex-shrink-0`}>
+              {meta.icon}
             </div>
             <div className="flex-1">
-              <h3 className={`font-semibold ${statusMeta.titleColor}`}>{statusMeta.title}</h3>
-              <p className={`text-sm ${statusMeta.descColor}`}>{statusMeta.desc}</p>
-              {isWaiting && state.status !== "creating_email" && (
-                <div className="mt-2 flex items-center gap-2 text-xs text-zinc-400">
+              <h3 className={`font-semibold ${meta.titleColor}`}>{meta.title}</h3>
+              <p className={`text-sm ${meta.descColor}`}>{meta.desc}</p>
+              {isWaiting && (
+                <div className="mt-2 flex items-center gap-3 text-xs text-zinc-400">
                   <Loader2 className="size-3 animate-spin" />
-                  Monitorando email + OAuth a cada 5s — aguardando você concluir…
+                  <span>Polling a cada 5s</span>
+                  <span className="text-zinc-600">·</span>
+                  <span>{elapsed}s decorridos</span>
                 </div>
               )}
             </div>
@@ -541,7 +699,7 @@ function CreateJobPanel({
         </CardContent>
       </Card>
 
-      {/* === STEP 1: Open the link === */}
+      {/* Verification URL */}
       {isWaiting && state.verificationUrl && (
         <Card className="bg-zinc-900/60 border-zinc-800 border-emerald-900/40">
           <CardHeader>
@@ -551,7 +709,8 @@ function CreateJobPanel({
               Abra este link no seu navegador
             </CardTitle>
             <CardDescription>
-              Esta é a página oficial do xAI para autorizar o <code className="text-emerald-300 bg-zinc-800 px-1 rounded">grok-proxy-cli</code>.
+              Página oficial do xAI para autorizar o <code className="text-emerald-300 bg-zinc-800 px-1 rounded">grok-proxy-cli</code>.
+              Faça login (ou crie conta) e clique em "Allow".
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -577,189 +736,15 @@ function CreateJobPanel({
             <div className="rounded-md bg-zinc-950/60 border border-zinc-800 p-3 text-xs">
               <span className="text-zinc-500">user_code (caso peça):</span>{" "}
               <code className="text-emerald-300 font-bold tracking-wider">{state.userCode}</code>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="ml-2 p-1 h-auto"
+                onClick={() => onCopy(state.userCode || "", "user_code")}
+              >
+                <Copy className="size-3" />
+              </Button>
             </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* === STEP 2: Sign up with email + your own password === */}
-      {isWaiting && state.mail && (
-        <Card className="bg-zinc-900/60 border-zinc-800 border-cyan-900/40">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-base">
-              <span className="size-6 rounded-full bg-cyan-500/20 text-cyan-300 text-xs font-bold flex items-center justify-center">2</span>
-              <Mail className="size-4 text-cyan-400" />
-              Na página do xAI, clique em <span className="text-cyan-300">"Sign up"</span> e use:
-            </CardTitle>
-            <CardDescription>
-              ⚠️ <b>Não use "Sign in"</b> — a conta ainda não existe. Clique em <b>Sign up</b> / <b>Create account</b>.
-              Escolha <b>SUA PRÓPRIA senha</b> para o xAI (você decide qual).
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid gap-3 md:grid-cols-2">
-              {/* Email */}
-              <div className="space-y-2">
-                <Label className="text-xs text-zinc-400">Email temporário (use no xAI)</Label>
-                <Input
-                  readOnly
-                  value={state.mail.address}
-                  className="font-mono text-sm bg-zinc-950 border-zinc-800"
-                />
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => onCopy(state.mail!.address, "Email")}
-                  className="w-full border-zinc-700"
-                >
-                  <Copy className="size-3 mr-2" /> Copiar email
-                </Button>
-              </div>
-
-              {/* mail.tm password (just for reading the email) */}
-              <div className="space-y-2">
-                <Label className="text-xs text-zinc-400">
-                  Senha do mail.tm (só pra ler o email — NÃO use no xAI)
-                </Label>
-                <div className="flex gap-2">
-                  <Input
-                    readOnly
-                    type={showPassword ? "text" : "password"}
-                    value={state.mail.password}
-                    className="font-mono text-sm bg-zinc-950 border-zinc-800"
-                  />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={onTogglePassword}
-                    className="border-zinc-700"
-                  >
-                    {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-                  </Button>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => onCopy(state.mail!.password, "Senha mail.tm")}
-                  className="w-full border-zinc-700"
-                >
-                  <Copy className="size-3 mr-2" /> Copiar senha mail.tm
-                </Button>
-              </div>
-            </div>
-
-            <Alert className="border-amber-900/40 bg-amber-950/20">
-              <AlertCircle className="size-4 text-amber-400" />
-              <AlertDescription className="text-xs text-amber-200/80">
-                <b>Resumo:</b> No xAI você vai criar a conta com o email acima + uma senha que VOCÊ escolhe.
-                A senha do mail.tm mostrada aqui serve só pra você acessar a caixa de entrada se quiser ver os emails manualmente —
-                nós já vamos detectar os códigos automaticamente abaixo.
-              </AlertDescription>
-            </Alert>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* === STEP 3: Verification code (auto-detected) === */}
-      {isWaiting && (
-        <Card className={`bg-zinc-900/60 border-2 ${hasCode ? "border-emerald-500 shadow-lg shadow-emerald-500/20" : "border-zinc-800 border-dashed"}`}>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-base">
-              <span className={`size-6 rounded-full ${hasCode ? "bg-emerald-500" : "bg-zinc-700"} text-white text-xs font-bold flex items-center justify-center`}>3</span>
-              {hasCode ? (
-                <span className="flex items-center gap-2 text-emerald-300">
-                  <Key className="size-4" /> Código de verificação recebido!
-                </span>
-              ) : (
-                <span className="flex items-center gap-2 text-zinc-300">
-                  <Clock className="size-4 animate-pulse" /> Aguardando código de verificação do xAI…
-                </span>
-              )}
-            </CardTitle>
-            <CardDescription>
-              {hasCode
-                ? "Copie este código e cole na página do xAI."
-                : "Assim que o xAI enviar o código, vamos pegá-lo do mail.tm e mostrar aqui automaticamente."}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            {hasCode ? (
-              <div className="space-y-3">
-                <div className="flex gap-2">
-                  <Input
-                    readOnly
-                    value={state.latestCode || ""}
-                    className="font-mono text-3xl text-center tracking-[0.5em] font-bold bg-zinc-950 border-emerald-700 text-emerald-300 py-6"
-                  />
-                  <Button
-                    size="lg"
-                    onClick={() => onCopy(state.latestCode || "", "Código")}
-                    className="bg-emerald-600 hover:bg-emerald-500 px-6"
-                  >
-                    <Copy className="size-5" />
-                  </Button>
-                </div>
-                <p className="text-xs text-emerald-400/80 text-center">
-                  ✅ Detectado automaticamente do email recebido no mail.tm
-                </p>
-              </div>
-            ) : (
-              <div className="flex items-center justify-center py-8 gap-3 text-zinc-500">
-                <Loader2 className="size-5 animate-spin" />
-                <span className="text-sm">Checando inbox a cada 5s…</span>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      )}
-
-      {/* === STEP 4: Authorize === */}
-      {isWaiting && state.verificationUrl && (
-        <Card className="bg-zinc-900/60 border-zinc-800 border-amber-900/40">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-base">
-              <span className="size-6 rounded-full bg-amber-500/20 text-amber-300 text-xs font-bold flex items-center justify-center">4</span>
-              <CheckCircle2 className="size-4 text-amber-400" />
-              Depois de logado, clique em <span className="text-amber-300">"Allow"</span>
-            </CardTitle>
-            <CardDescription>
-              O xAI vai perguntar se você autoriza o <code className="text-zinc-300 bg-zinc-800 px-1 rounded">grok-proxy-cli</code> a
-              acessar sua conta. Clique em <b>Allow</b> e pronto — vamos detectar o token automaticamente.
-            </CardDescription>
-          </CardHeader>
-        </Card>
-      )}
-
-      {/* Inbox messages (transparency) */}
-      {isWaiting && state.inbox.length > 0 && (
-        <Card className="bg-zinc-900/60 border-zinc-800">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-sm">
-              <Mail className="size-4 text-zinc-400" />
-              Emails recebidos no mail.tm ({state.inbox.length})
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ScrollArea className="max-h-64 rounded-md">
-              <div className="space-y-2">
-                {state.inbox.map((m) => (
-                  <div key={m.id} className="rounded-md border border-zinc-800 bg-zinc-950/40 p-3 text-xs">
-                    <div className="flex items-center justify-between gap-2 mb-1">
-                      <span className="font-mono text-zinc-400 truncate">{m.from}</span>
-                      {m.code && (
-                        <Badge variant="default" className="bg-emerald-600 text-white shrink-0">
-                          code: {m.code}
-                        </Badge>
-                      )}
-                    </div>
-                    <div className="text-zinc-200 font-medium mb-1">{m.subject}</div>
-                    <div className="text-zinc-500 line-clamp-2 font-mono text-[10px]">
-                      {m.text.slice(0, 200)}…
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </ScrollArea>
           </CardContent>
         </Card>
       )}
@@ -769,7 +754,7 @@ function CreateJobPanel({
         <Card className="bg-emerald-950/40 border-emerald-900/60">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-emerald-300">
-              <CheckCircle2 className="size-5" /> Conta criada e salva!
+              <CheckCircle2 className="size-5" /> Conta adicionada e ativada!
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-3 text-sm">
@@ -777,15 +762,15 @@ function CreateJobPanel({
               <div className="col-span-1 text-zinc-400">ID</div>
               <div className="col-span-2 font-mono text-xs">{state.account.id}</div>
               <div className="col-span-1 text-zinc-400">Email</div>
-              <div className="col-span-2">{state.account.email}</div>
+              <div className="col-span-2">{state.account.email || "—"}</div>
               <div className="col-span-1 text-zinc-400">Team</div>
               <div className="col-span-2 font-mono text-xs">{state.account.team_id || "—"}</div>
               <div className="col-span-1 text-zinc-400">Expira</div>
               <div className="col-span-2">{new Date(state.account.expires_at).toLocaleString("pt-BR")}</div>
             </div>
             <div className="pt-3 border-t border-emerald-900/40 text-xs text-emerald-400/80">
-              ✅ A conta foi salva no navegador. Volte para a aba <b>Contas</b> para exportá-la no
-              formato do grok-proxy-cli.
+              ✅ A conta foi salva e marcada como ativa. Volte para a aba <b>Contas</b> para exportá-la
+              no formato do grok-proxy-cli.
             </div>
           </CardContent>
         </Card>
@@ -809,12 +794,12 @@ function CreateJobPanel({
   )
 }
 
-function getStatusMeta(status: CreateStatus) {
+function getAddStatusMeta(status: AddStatus) {
   switch (status) {
-    case "creating_email":
+    case "starting":
       return {
-        title: "Criando email temporário…",
-        desc: "Conectando ao mail.tm",
+        title: "Iniciando…",
+        desc: "Solicitando device code em auth.x.ai",
         icon: <Loader2 className="size-5 animate-spin" />,
         bg: "bg-cyan-950/40 border-cyan-900/60",
         border: "border-cyan-900/60",
@@ -837,8 +822,8 @@ function getStatusMeta(status: CreateStatus) {
       }
     case "polling":
       return {
-        title: "Polling ativo",
-        desc: "Aguardando você concluir no browser. Vamos detectar automaticamente.",
+        title: "Aguardando autorização",
+        desc: "Polling ativo — vamos detectar o token assim que você autorizar",
         icon: <Loader2 className="size-5 animate-spin" />,
         bg: "bg-amber-950/40 border-amber-900/60",
         border: "border-amber-900/60",
@@ -849,8 +834,8 @@ function getStatusMeta(status: CreateStatus) {
       }
     case "saved":
       return {
-        title: "Conta criada com sucesso!",
-        desc: "Token salvo no navegador",
+        title: "Conta adicionada!",
+        desc: "Token salvo no navegador e marcado como ativo",
         icon: <CheckCircle2 className="size-5" />,
         bg: "bg-emerald-950/40 border-emerald-900/60",
         border: "border-emerald-900/60",
@@ -861,7 +846,7 @@ function getStatusMeta(status: CreateStatus) {
       }
     case "error":
       return {
-        title: "Falha na criação",
+        title: "Falha",
         desc: "Veja detalhes abaixo",
         icon: <AlertCircle className="size-5" />,
         bg: "bg-red-950/40 border-red-900/60",
@@ -883,5 +868,175 @@ function getStatusMeta(status: CreateStatus) {
         titleColor: "",
         descColor: "",
       }
+  }
+}
+
+// ============================================================
+//  Logs Panel
+// ============================================================
+function LogsPanel() {
+  const [entries, setEntries] = useState<LogEntry[]>(() => getLogs().slice().reverse())
+  const [filterLevel, setFilterLevel] = useState<LogLevel | "all">("all")
+  const [filterSource, setFilterSource] = useState<string>("all")
+  const [autoScroll, setAutoScroll] = useState(true)
+  const scrollRef = useRef<HTMLDivElement>(null)
+
+  const refresh = useCallback(() => {
+    setEntries(getLogs().slice().reverse()) // newest first
+  }, [])
+
+  useEffect(() => {
+    const unsub = subscribeLogs(refresh)
+    return () => { unsub() }
+  }, [refresh])
+
+  // Auto-scroll to top when new entries arrive
+  useEffect(() => {
+    if (autoScroll && scrollRef.current) {
+      scrollRef.current.scrollTop = 0
+    }
+  }, [entries, autoScroll])
+
+  const filtered = entries.filter((e) => {
+    if (filterLevel !== "all" && e.level !== filterLevel) return false
+    if (filterSource !== "all" && e.source !== filterSource) return false
+    return true
+  })
+
+  const sources = Array.from(new Set(entries.map((e) => e.source)))
+
+  return (
+    <Card className="bg-zinc-900/60 border-zinc-800">
+      <CardHeader>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <CardTitle className="flex items-center gap-2">
+              <Terminal className="size-5 text-emerald-400" />
+              Logs
+              <Badge variant="outline" className="border-zinc-700 text-zinc-400 ml-2">
+                {filtered.length} {filtered.length === 1 ? "entrada" : "entradas"}
+              </Badge>
+            </CardTitle>
+            <CardDescription className="text-zinc-400 mt-1">
+              Histórico de ações da Web UI: OAuth, salvamento de contas, rotações, erros.
+            </CardDescription>
+          </div>
+          <div className="flex items-center gap-2">
+            <Select value={filterLevel} onValueChange={(v) => setFilterLevel(v as any)}>
+              <SelectTrigger className="w-32 h-8 bg-zinc-950 border-zinc-800 text-xs">
+                <SelectValue placeholder="Nível" />
+              </SelectTrigger>
+              <SelectContent className="bg-zinc-900 border-zinc-800">
+                <SelectItem value="all">Todos</SelectItem>
+                <SelectItem value="success">Success</SelectItem>
+                <SelectItem value="info">Info</SelectItem>
+                <SelectItem value="warn">Warn</SelectItem>
+                <SelectItem value="error">Error</SelectItem>
+                <SelectItem value="debug">Debug</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select value={filterSource} onValueChange={setFilterSource}>
+              <SelectTrigger className="w-32 h-8 bg-zinc-950 border-zinc-800 text-xs">
+                <SelectValue placeholder="Fonte" />
+              </SelectTrigger>
+              <SelectContent className="bg-zinc-900 border-zinc-800">
+                <SelectItem value="all">Todas</SelectItem>
+                {sources.map((s) => (
+                  <SelectItem key={s} value={s}>{s}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setAutoScroll(!autoScroll)}
+              className={`h-8 ${autoScroll ? "border-emerald-700 text-emerald-300" : "border-zinc-700"}`}
+              title="Auto-scroll para o topo"
+            >
+              <RefreshCw className={`size-3 mr-1 ${autoScroll ? "animate-spin" : ""}`} />
+              Auto
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                if (confirm("Limpar todos os logs?")) {
+                  clearLogs()
+                  refresh()
+                }
+              }}
+              className="h-8 border-red-900/50 text-red-300 hover:bg-red-950/40"
+            >
+              <Trash2 className="size-3 mr-1" />
+              Limpar
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {filtered.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12 text-center">
+            <Terminal className="size-8 text-zinc-700 mb-3" />
+            <p className="text-sm text-zinc-500">
+              {entries.length === 0
+                ? "Nenhum log ainda. As ações aparecem aqui em tempo real."
+                : "Nenhum log corresponde aos filtros."}
+            </p>
+          </div>
+        ) : (
+          <div
+            ref={scrollRef}
+            className="max-h-[60vh] overflow-y-auto rounded-md border border-zinc-800 bg-zinc-950/60 font-mono text-xs"
+          >
+            <div className="divide-y divide-zinc-900">
+              {filtered.map((e) => (
+                <LogLine key={e.id} entry={e} />
+              ))}
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function LogLine({ entry }: { entry: LogEntry }) {
+  const meta = getLogMeta(entry.level)
+  const time = new Date(entry.ts).toLocaleTimeString("pt-BR", { hour12: false })
+  const date = new Date(entry.ts).toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" })
+
+  return (
+    <div className={`flex items-start gap-3 px-3 py-2 ${meta.bg}`}>
+      <span className="text-zinc-600 shrink-0">{date} {time}</span>
+      <span className={`shrink-0 font-bold ${meta.color}`}>
+        [{entry.level.toUpperCase().padEnd(5)}]
+      </span>
+      <span className="shrink-0 text-zinc-500">
+        [{entry.source}]
+      </span>
+      <span className="text-zinc-200 break-all flex-1">
+        {entry.msg}
+        {entry.meta && Object.keys(entry.meta).length > 0 && (
+          <span className="text-zinc-500 ml-2">
+            {" "}{JSON.stringify(entry.meta)}
+          </span>
+        )}
+      </span>
+    </div>
+  )
+}
+
+function getLogMeta(level: LogLevel) {
+  switch (level) {
+    case "success":
+      return { color: "text-emerald-400", bg: "hover:bg-emerald-950/20" }
+    case "info":
+      return { color: "text-cyan-400", bg: "hover:bg-cyan-950/20" }
+    case "warn":
+      return { color: "text-amber-400", bg: "hover:bg-amber-950/20" }
+    case "error":
+      return { color: "text-red-400", bg: "hover:bg-red-950/20" }
+    case "debug":
+      return { color: "text-zinc-500", bg: "hover:bg-zinc-900" }
   }
 }

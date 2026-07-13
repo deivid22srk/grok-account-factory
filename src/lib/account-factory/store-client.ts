@@ -10,6 +10,11 @@ export interface StoredAccount extends AccountInfo {
   label: string;
   created_at: string;
   updated_at: string;
+  limited?: boolean;
+  limited_reason?: string;
+  limited_until?: string;  // ISO
+  last_used?: string;       // ISO
+  last_error?: string;
 }
 
 const STORAGE_KEY = "grok_accounts_v1";
@@ -45,12 +50,83 @@ export function saveAccount(acc: AccountInfo, makeActive = true): StoredAccount 
     label,
     created_at: createdAt,
     updated_at: nowIso(),
+    // Preserve limited state from existing
+    limited: existing?.limited,
+    limited_reason: existing?.limited_reason,
+    limited_until: existing?.limited_until,
+    last_used: existing?.last_used,
+    last_error: existing?.last_error,
   };
   const next = all.filter((a) => a.id !== acc.id);
   next.push(stored);
   writeAll(next);
   if (makeActive) setActive(acc.id);
   return stored;
+}
+
+export function markLimited(id: string, reason: string, until?: Date): void {
+  const all = readAll();
+  const acc = all.find((a) => a.id === id);
+  if (!acc) return;
+  acc.limited = true;
+  acc.limited_reason = reason;
+  acc.limited_until = until ? until.toISOString() : undefined;
+  acc.updated_at = nowIso();
+  writeAll(all);
+}
+
+export function markAvailable(id: string): void {
+  const all = readAll();
+  const acc = all.find((a) => a.id === id);
+  if (!acc) return;
+  acc.limited = false;
+  acc.limited_reason = undefined;
+  acc.limited_until = undefined;
+  acc.updated_at = nowIso();
+  writeAll(all);
+}
+
+export function markUsed(id: string): void {
+  const all = readAll();
+  const acc = all.find((a) => a.id === id);
+  if (!acc) return;
+  acc.last_used = nowIso();
+  writeAll(all);
+}
+
+/** Auto-rotate: pick next non-limited, non-expired account. Returns new active id or null. */
+export function rotateToNextAvailable(): string | null {
+  const all = readAll();
+  if (all.length === 0) return null;
+  const currentId = getActiveId();
+  const now = Date.now()
+  const isAvailable = (a: StoredAccount) => {
+    if (a.limited) {
+      if (a.limited_until && new Date(a.limited_until).getTime() > now) return false
+      // limited window expired → auto-unmark
+    }
+    if (a.expires_at && new Date(a.expires_at).getTime() < now) return false
+    return true
+  }
+  // First, auto-clear expired limits
+  for (const a of all) {
+    if (a.limited && a.limited_until && new Date(a.limited_until).getTime() <= now) {
+      a.limited = false
+      a.limited_reason = undefined
+      a.limited_until = undefined
+    }
+  }
+  writeAll(all)
+  // Find next available after current
+  const available = all.filter(isAvailable)
+  if (available.length === 0) return null
+  // If current is available, keep it
+  const current = all.find((a) => a.id === currentId)
+  if (current && isAvailable(current)) return currentId
+  // Otherwise, pick first available
+  const next = available[0]
+  setActive(next.id)
+  return next.id
 }
 
 export function listAccounts(): StoredAccount[] {

@@ -6,6 +6,8 @@
  * volume. You can override via the CORS_PROXY env var or localStorage.
  */
 
+import { logInfo, logWarn, logError, logDebug } from "./logger";
+
 export const DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 export const DEFAULT_ISSUER = "https://auth.x.ai";
 export const DEFAULT_SCOPES =
@@ -95,12 +97,17 @@ export class OAuthClient {
   }
 
   async startDevice(): Promise<DeviceStart> {
+    logInfo("oauth", `POST ${this.issuer}/oauth2/device/code (via proxy)`);
     const body = new URLSearchParams({
       client_id: this.clientId,
       scope: this.scopes,
     });
     const data = await this.postFormViaProxy(`${this.issuer}/oauth2/device/code`, body);
-    if (!data.device_code || !data.user_code) throw new Error(`invalid device/code response: ${JSON.stringify(data)}`);
+    if (!data.device_code || !data.user_code) {
+      logError("oauth", `Resposta inválida do device/code: ${JSON.stringify(data)}`);
+      throw new Error(`invalid device/code response: ${JSON.stringify(data)}`);
+    }
+    logInfo("oauth", `Device code obtido: ${data.user_code} (expira em ${data.expires_in ?? 1800}s)`);
     return {
       device_code: data.device_code,
       user_code: data.user_code,
@@ -209,10 +216,12 @@ export class OAuthClient {
   }
 
   async accountFromToken(tok: TokenResponse): Promise<AccountInfo> {
+    logInfo("oauth", "Decodificando JWT e buscando userinfo…");
     const { teamId, sub } = this.claimsFromAccess(tok.access_token);
     const { email, sub: uiSub } = await this.userinfo(tok.access_token);
     const userId = sub || uiSub || `acc_${Date.now()}`;
     const expiresAt = new Date(Date.now() + tok.expires_in * 1000).toISOString();
+    logInfo("oauth", `Token processado: id=${userId.slice(0, 16)}, email=${email || "—"}, team=${teamId || "—"}`);
     return {
       id: userId,
       email,
