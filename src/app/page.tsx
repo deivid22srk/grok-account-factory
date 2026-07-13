@@ -24,7 +24,7 @@ import {
   Plus, RefreshCw, Trash2, Star, Copy, ExternalLink, Key, Mail, Lock, Clock,
   CheckCircle2, AlertCircle, Loader2, Zap, User, Activity, Eye, EyeOff, Download,
 } from "lucide-react"
-import { TempMailClient, type TempMailAccount } from "@/lib/account-factory/tempmail-client"
+import { TempMailClient, extractCodeFromEmail, type TempMailAccount } from "@/lib/account-factory/tempmail-client"
 import { OAuthClient, type AccountInfo } from "@/lib/account-factory/oauth-client"
 import {
   listAccounts, saveAccount, removeAccount, setActive, getActiveId,
@@ -34,6 +34,15 @@ import {
 type TabKey = "accounts" | "create"
 type CreateStatus = "idle" | "creating_email" | "awaiting_authorization" | "polling" | "saved" | "error"
 
+interface InboxMessage {
+  id: string
+  from: string
+  subject: string
+  text: string
+  date: string
+  code?: string | null
+}
+
 interface CreateState {
   status: CreateStatus
   mail?: TempMailAccount
@@ -41,17 +50,20 @@ interface CreateState {
   userCode?: string
   account?: AccountInfo
   error?: string
+  inbox: InboxMessage[]
+  latestCode?: string | null
 }
 
 export default function Home() {
   const [tab, setTab] = useState<TabKey>("accounts")
   const [accounts, setAccounts] = useState<StoredAccount[]>([])
   const [activeId, setActiveId] = useState("")
-  const [create, setCreate] = useState<CreateState>({ status: "idle" })
+  const [create, setCreate] = useState<CreateState>({ status: "idle", inbox: [] })
   const [showPassword, setShowPassword] = useState(false)
   const [busy, setBusy] = useState(false)
   const { toast } = useToast()
   const pollRef = useRef<NodeJS.Timeout | null>(null)
+  const inboxRef = useRef<NodeJS.Timeout | null>(null)
   const stopPollRef = useRef<boolean>(false)
 
   const refreshAccounts = useCallback(() => {
@@ -68,12 +80,13 @@ export default function Home() {
     return () => {
       stopPollRef.current = true
       if (pollRef.current) clearInterval(pollRef.current)
+      if (inboxRef.current) clearInterval(inboxRef.current)
     }
   }, [])
 
   const handleCreate = async () => {
     setTab("create")
-    setCreate({ status: "creating_email" })
+    setCreate({ status: "creating_email", inbox: [] })
     setBusy(true)
     stopPollRef.current = false
 
@@ -84,7 +97,7 @@ export default function Home() {
       // 1) temp email
       const mailAcc = await mail.createAccount()
       if (stopPollRef.current) return
-      setCreate((s) => ({ ...s, status: "awaiting_authorization", mail: mailAcc }))
+      setCreate((s) => ({ ...s, status: "awaiting_authorization", mail: mailAcc, inbox: [] }))
 
       // 2) start OAuth device flow
       const start = await oauth.startDevice()
@@ -95,10 +108,14 @@ export default function Home() {
         mail: mailAcc,
         verificationUrl: start.verification_uri_complete,
         userCode: start.user_code,
+        inbox: [],
       }))
-      toast({ title: "URL pronta — abra o link para autorizar" })
+      toast({ title: "Tudo pronto — siga as instruções abaixo" })
 
-      // 3) poll for token (in background, not awaited so UI stays responsive)
+      // 3) start inbox polling in parallel — auto-detect verification codes
+      startInboxPolling(mailAcc)
+
+      // 4) poll for token (in background, not awaited so UI stays responsive)
       oauth
         .pollDevice(start.device_code, start.interval, start.expires_in, () => {})
         .then(async (tok) => {
@@ -110,9 +127,11 @@ export default function Home() {
             setCreate((s) => ({ ...s, status: "saved", account: acc }))
             toast({ title: "Conta criada!", description: `Email: ${acc.email}` })
             refreshAccounts()
+            stopInboxPolling()
           } catch (e: any) {
             setCreate((s) => ({ ...s, status: "error", error: e.message || String(e) }))
             toast({ title: "Erro ao salvar", description: e.message, variant: "destructive" })
+            stopInboxPolling()
           } finally {
             setBusy(false)
           }
@@ -121,6 +140,7 @@ export default function Home() {
           if (stopPollRef.current) return
           setCreate((s) => ({ ...s, status: "error", error: e.message || String(e) }))
           toast({ title: "OAuth falhou", description: e.message, variant: "destructive" })
+          stopInboxPolling()
           setBusy(false)
         })
     } catch (e: any) {
@@ -130,10 +150,70 @@ export default function Home() {
     }
   }
 
+  // Poll the mail.tm inbox every 5s and surface new messages + extracted codes
+  const startInboxPolling = (mailAcc: TempMailAccount) => {
+    stopInboxPolling()
+    const mail = new TempMailClient()
+    const seen = new Set<string>()
+    let latestCode: string | null = null
+
+    const tick = async () => {
+      if (stopPollRef.current) {
+        stopInboxPolling()
+        return
+      }
+      try {
+        const inbox = await mail.fetchInbox(mailAcc)
+        const newMessages: InboxMessage[] = []
+        for (const msg of inbox) {
+          const id = msg.id || (msg["@id"] || "").split("/").pop()
+          if (!id || seen.has(id)) continue
+          seen.add(id)
+          const full = await mail.getMessage(mailAcc, id)
+          const body = (full.text || "") + "\n" + (full.html || "")
+          const code = extractCodeFromEmail(body)
+          newMessages.push({
+            id,
+            from: typeof full.from === "object" && full.from ? full.from.address || "" : String(full.from || ""),
+            subject: full.subject || "",
+            text: full.text || "",
+            date: full.createdAt || new Date().toISOString(),
+            code,
+          })
+          if (code && !latestCode) {
+            latestCode = code
+            toast({ title: "Código recebido!", description: code })
+          }
+        }
+        if (newMessages.length > 0) {
+          setCreate((s) => {
+            const merged = [...newMessages, ...s.inbox]
+            const newLatest = latestCode || s.latestCode
+            return { ...s, inbox: merged, latestCode: newLatest }
+          })
+        }
+      } catch (e) {
+        // network hiccup, retry next tick
+      }
+    }
+
+    // Run immediately + every 5s
+    tick()
+    inboxRef.current = setInterval(tick, 5000)
+  }
+
+  const stopInboxPolling = () => {
+    if (inboxRef.current) {
+      clearInterval(inboxRef.current)
+      inboxRef.current = null
+    }
+  }
+
   const handleCancelCreate = () => {
     stopPollRef.current = true
     if (pollRef.current) clearInterval(pollRef.current)
-    setCreate({ status: "idle" })
+    stopInboxPolling()
+    setCreate({ status: "idle", inbox: [] })
     setBusy(false)
     setTab("accounts")
   }
@@ -397,10 +477,10 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
 
 function FlowSteps() {
   const steps = [
-    { n: 1, title: "Email temporário", desc: "Criamos um endereço @mail.tm para receber o código de verificação" },
-    { n: 2, title: "OAuth device flow", desc: "Iniciamos o fluxo em auth.x.ai e obtemos um user_code" },
-    { n: 3, title: "Você autoriza", desc: "Abrimos um link; você entra com o email temporário e autoriza o grok-proxy-cli" },
-    { n: 4, title: "Token salvo", desc: "Recebemos o access_token + refresh_token e gravamos no navegador" },
+    { n: 1, title: "Email temporário", desc: "Criamos um endereço @mail.tm para receber o código de verificação do xAI" },
+    { n: 2, title: "Você cria a conta xAI", desc: "Abre o link, clica em Sign up, usa o email temporário e ESCOLHE SUA PRÓPRIA senha" },
+    { n: 3, title: "Código auto-detectado", desc: "xAI envia o código de verificação → pegamos do mail.tm automaticamente e te mostramos" },
+    { n: 4, title: "Token salvo", desc: "Você autoriza o grok-proxy-cli → recebemos o access_token + refresh_token" },
   ]
   return (
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
